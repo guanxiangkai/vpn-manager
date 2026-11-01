@@ -9,9 +9,9 @@ permissions:
   contents: read
 
 jobs:
-  api:
+  test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: 获取源码
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -23,7 +23,13 @@ jobs:
           python-version: '3.11'
       - name: 安装应用与测试依赖
         run: python -m pip install --disable-pip-version-check -e '.[test]'
+      - name: 安装 Chromium 浏览器验收依赖
+        run: |
+          python -m pip install --disable-pip-version-check playwright
+          python -m playwright install --with-deps chromium
       - name: 检查依赖一致性
         run: python -m pip check
       - name: 运行接口回归测试
-        run: python -m pytest -q -p no:cacheprovider
+        run: python -m pytest tests/test_api.py -q -p no:cacheprovider
+      - name: 运行原生 HTTPS Chromium 验收
+        run: bash tests/run_browser_acceptance.sh

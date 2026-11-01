@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vpn-manager"
 version = "0.1.0"
-description = "设备绑定、账户权限与审计日志的 VPN 管理服务（测试阶段）"
+description = "账户密码、网络权限与审计日志的 VPN 管理服务"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"

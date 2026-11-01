@@ -66,23 +66,16 @@ class MeResponse(UserView):
     csrf_token: str
 
 
-class DeviceReserve(StrictModel):
+class DeviceCreate(StrictModel):
     device_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
-    vpn_certificate_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
-    web_certificate_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
 
 
 class DeviceView(StrictModel):
     account_id: str
     device_id: str
-    vpn_certificate_id: str
-    web_certificate_id: str
-    state: Literal["pending", "active", "revoking", "revoked"]
+    state: Literal["registered", "removed"]
     created_at: datetime
     updated_at: datetime
-    revocation_requested_at: datetime | None
-    manager_access: Literal["allowed", "revoked"]
-    gateway_revocation: Literal["not_requested", "pending", "acknowledged"]
 
 
 class MessageResponse(StrictModel):

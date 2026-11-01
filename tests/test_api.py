@@ -2,226 +2,310 @@ from __future__ import annotations
 
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Barrier, Event
 
 from fastapi.testclient import TestClient
 import pytest
 
 from vpn_manager.app import ALLOWED_ORIGIN, create_app
 from vpn_manager.bootstrap import bootstrap
-from vpn_manager.device_verification import VerifiedDevicePrincipal
-from vpn_manager.security import COOKIE_NAME, utc_text
+from vpn_manager.security import COOKIE_NAME, hash_password, token_hash, utc_text
 from vpn_manager.store import DeviceQuotaExceeded, Store
-
-
-class FixtureVerifier:
-    """显式注入测试主体，绝不从 HTTP 输入推导设备身份。"""
-
-    def __init__(self, principal: VerifiedDevicePrincipal) -> None:
-        self.principal = principal
-
-    def verify(self, _request) -> VerifiedDevicePrincipal:
-        return self.principal
 
 
 @pytest.fixture()
 def database(tmp_path):
-    path = tmp_path / "manager.sqlite3"
+    path = tmp_path / 'manager.sqlite3'
     bootstrap(str(path), [
-        {"username": "adminone", "password": "correct-horse-admin-one", "role": "admin", "networks": ["home", "work"]},
-        {"username": "member", "password": "correct-horse-member", "role": "user", "networks": ["work"]},
+        {'username':'adminone','password':'correct-horse-admin-one','role':'admin','networks':['home','work']},
+        {'username':'member','password':'correct-horse-member','role':'user','networks':['work']},
     ])
-    enroll(path, "adminone", "admin-device", "vpn-admin", "web-admin", "active")
-    enroll(path, "member", "member-device", "vpn-member", "web-member", "active")
     return path
 
 
-def enroll(database, account: str, device: str, vpn_certificate: str, web_certificate: str, state: str) -> None:
-    store = Store(database)
-    with store.write_transaction() as connection:
-        now = utc_text()
-        connection.execute(
-            "INSERT INTO devices(account_id, device_id, vpn_certificate_id, web_certificate_id, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (account, device, vpn_certificate, web_certificate, state, now, now),
-        )
+def client_for(database, address='192.0.2.10'):
+    return TestClient(create_app(database),base_url=ALLOWED_ORIGIN,client=(address,12345))
 
 
-def principal(account: str, device: str, web_certificate: str) -> VerifiedDevicePrincipal:
-    return VerifiedDevicePrincipal(account, device, web_certificate)
+def login(client,username='adminone',password='correct-horse-admin-one'):
+    response=client.post('/api/auth/login',headers={'Origin':ALLOWED_ORIGIN},json={'username':username,'password':password})
+    assert response.status_code==200,response.text
+    return response.json()['csrf_token']
 
 
-def client_for(database, device_principal: VerifiedDevicePrincipal) -> TestClient:
-    return TestClient(create_app(database, device_verifier=FixtureVerifier(device_principal)), base_url="https://slimjoy.cn")
+def csrf(token):
+    return {'Origin':ALLOWED_ORIGIN,'X-CSRF-Token':token}
 
 
-def login(client: TestClient, username: str, password: str) -> str:
-    response = client.post("/api/auth/login", headers={"Origin": ALLOWED_ORIGIN}, json={"username": username, "password": password})
-    assert response.status_code == 200, response.text
-    return response.json()["csrf_token"]
+def test_password_login_requires_no_device_and_preserves_cookie_controls(database):
+    client=client_for(database)
+    assert client.get('/api/auth/me').status_code==401
+    assert client.get('/health').status_code==200
+    token=login(client)
+    response=client.get('/api/auth/me')
+    assert response.json()['networks']==['home','work']
+    assert 'csrf_token' not in response.json()
+    assert client.post('/api/auth/logout',headers=csrf(token)).status_code==200
+    assert client.get('/api/auth/me').status_code==401
+    response=client.post('/api/auth/login',headers={'Origin':ALLOWED_ORIGIN},json={'username':'member','password':'correct-horse-member'})
+    cookie=response.headers['set-cookie'].lower()
+    assert 'secure' in cookie and 'httponly' in cookie and 'samesite=lax' in cookie
+    assert response.json()['user']['networks']==['work']
 
 
-def csrf(token: str) -> dict[str, str]:
-    return {"Origin": ALLOWED_ORIGIN, "X-CSRF-Token": token}
+def test_session_refresh_origin_csrf_and_single_session_logout(database):
+    first,second=client_for(database),client_for(database)
+    old=login(first)
+    login(second)
+    saved=first.cookies.get(COOKIE_NAME)
+    assert first.post('/api/auth/refresh').status_code==403
+    assert first.post('/api/auth/refresh',headers={'Origin':'https://evil.example'}).status_code==403
+    refresh=first.post('/api/auth/refresh',headers={'Origin':ALLOWED_ORIGIN})
+    fresh=refresh.json()['csrf_token']
+    assert fresh!=old
+    assert first.post('/api/auth/logout',headers=csrf(old)).status_code==403
+    assert first.post('/api/auth/logout',headers=csrf(fresh)).status_code==200
+    first.cookies.set(COOKIE_NAME,saved)
+    assert first.get('/api/auth/me').status_code==401
+    assert second.get('/api/auth/me').status_code==200
 
 
-def test_default_is_locked_and_spoofed_headers_do_not_create_a_principal(database) -> None:
-    client = TestClient(create_app(database), base_url="https://slimjoy.cn")
-    response = client.post("/api/auth/login", headers={"Origin": ALLOWED_ORIGIN, "X-SSL-Client-CN": "member", "X-Device-Id": "member-device"}, json={"username": "member", "password": "correct-horse-member"})
-    assert response.status_code == 503
-    assert response.json() == {"error": {"code": "device_verification_unavailable", "message": "尚未配置设备验证服务。"}}
+def test_role_and_cross_account_device_boundaries(database):
+    admin,member=client_for(database),client_for(database)
+    a=login(admin)
+    m=login(member,'member','correct-horse-member')
+    assert member.get('/api/admin/users').status_code==403
+    assert member.get('/api/admin/audit').status_code==403
+    assert member.post('/api/admin/users/member/devices',headers=csrf(m),json={'device_id':'member-pc'}).status_code==403
+    assert admin.post('/api/admin/users/member/devices',headers=csrf(a),json={'device_id':'member-pc'}).status_code==201
+    assert member.get('/api/devices').json()[0]['device_id']=='member-pc'
+    assert member.post('/api/devices/admin-pc/remove',headers=csrf(m)).status_code==404
+    assert admin.post('/api/admin/users/member/devices/member-pc/remove',headers=csrf(a)).json()['state']=='removed'
+    # 设备只是记录，移除记录不能伪装为该设备已被阻止登录。
+    assert member.get('/api/auth/me').status_code==200
 
 
-def test_validation_and_account_mismatch_use_typed_error_responses(database) -> None:
-    member = client_for(database, principal("member", "member-device", "web-member"))
-    malformed = member.post("/api/auth/login", headers={"Origin": ALLOWED_ORIGIN}, json={"username": "member", "password": "correct-horse-member", "extra": "rejected"})
-    assert malformed.status_code == 422
-    assert malformed.json()["error"]["code"] == "invalid_request"
-    mismatch = member.post("/api/auth/login", headers={"Origin": ALLOWED_ORIGIN}, json={"username": "adminone", "password": "correct-horse-admin-one"})
-    assert mismatch.status_code == 403
-    assert mismatch.json()["error"]["code"] == "device_account_mismatch"
+@pytest.mark.parametrize('change',[{'password':'a-brand-new-password'},{'networks':['home']},{'active':False}])
+def test_account_change_revokes_all_sessions_and_reenable_does_not_restore(database,change):
+    admin,member=client_for(database),client_for(database)
+    a=login(admin)
+    login(member,'member','correct-horse-member')
+    assert admin.patch('/api/admin/users/member',headers=csrf(a),json=change).status_code==200
+    assert member.get('/api/auth/me').status_code==401
+    if change.get('active') is False:
+        assert admin.patch('/api/admin/users/member',headers=csrf(a),json={'active':True}).status_code==200
+        assert member.get('/api/auth/me').status_code==401
+    assert admin.get('/api/auth/me').status_code==200
 
 
-def test_pending_device_cannot_authenticate(database) -> None:
-    admin = client_for(database, principal("adminone", "admin-device", "web-admin"))
-    token = login(admin, "adminone", "correct-horse-admin-one")
-    reserved = admin.post("/api/admin/users/member/devices/reservations", headers=csrf(token), json={"device_id": "pending-device", "vpn_certificate_id": "vpn-pending", "web_certificate_id": "web-pending"})
-    assert reserved.status_code == 201
-    assert reserved.json()["state"] == "pending"
-    listed = admin.get("/api/admin/users/member/devices")
-    assert any(item["device_id"] == "pending-device" for item in listed.json())
-    pending = client_for(database, principal("member", "pending-device", "web-pending"))
-    denied = pending.post("/api/auth/login", headers={"Origin": ALLOWED_ORIGIN}, json={"username": "member", "password": "correct-horse-member"})
-    assert denied.status_code == 403
-    assert denied.json()["error"]["code"] == "device_not_active"
+def test_last_admin_cannot_be_removed_and_errors_do_not_echo_password(database):
+    client=client_for(database)
+    a=login(client)
+    assert client.patch('/api/admin/users/adminone',headers=csrf(a),json={'role':'user'}).status_code==409
+    assert client.post('/api/admin/users/adminone/deactivate',headers=csrf(a)).status_code==409
+    secret='do-not-echo-this-secret'
+    response=client.post('/api/auth/login',headers={'Origin':ALLOWED_ORIGIN},json={'username':'member','password':secret,'extra':'invalid'})
+    assert response.status_code==422 and secret not in response.text
+    assert client.post('/api/admin/users',headers={'Origin':ALLOWED_ORIGIN},json={'username':'newuser','password':secret,'role':'user','networks':['work']}).status_code==403
 
 
-def test_copied_cookie_is_bound_to_the_original_device(database) -> None:
-    original = client_for(database, principal("member", "member-device", "web-member"))
-    login(original, "member", "correct-horse-member")
-    copied = original.cookies.get(COOKIE_NAME)
-    enroll(database, "member", "member-device-two", "vpn-member-two", "web-member-two", "active")
-    other_device = client_for(database, principal("member", "member-device-two", "web-member-two"))
-    other_device.cookies.set(COOKIE_NAME, copied, domain="slimjoy.cn", path="/")
-    denied = other_device.get("/api/auth/me", headers={"Origin": ALLOWED_ORIGIN})
-    assert denied.status_code == 401
-    assert denied.json()["error"]["code"] == "authentication_required"
-
-
-def test_logout_revokes_exact_session_audits_and_rejects_cookie_replay(database) -> None:
-    member = client_for(database, principal("member", "member-device", "web-member"))
-    csrf_token = login(member, "member", "correct-horse-member")
-    old_cookie = member.cookies.get(COOKIE_NAME)
-    logged_out = member.post("/api/auth/logout", headers=csrf(csrf_token))
-    assert logged_out.status_code == 200
-    assert logged_out.json() == {"message": "已退出登录"}
-    replay = client_for(database, principal("member", "member-device", "web-member"))
-    replay.cookies.set(COOKIE_NAME, old_cookie, domain="slimjoy.cn", path="/")
-    denied = replay.get("/api/auth/me", headers={"Origin": ALLOWED_ORIGIN})
-    assert denied.status_code == 401
-    assert denied.json()["error"]["code"] == "authentication_required"
+def test_pair_source_and_account_limits_ignore_spoofed_forwarding_headers(database):
+    app=create_app(database)
+    client=TestClient(app,base_url=ALLOWED_ORIGIN,client=('192.0.2.11',12345))
+    for i in range(5):
+        r=client.post('/api/auth/login',headers={'Origin':ALLOWED_ORIGIN,'X-Forwarded-For':f'198.51.100.{i}'},json={'username':'member','password':'wrong-password'})
+        assert r.status_code==401
+    assert client.post('/api/auth/login',headers={'Origin':ALLOWED_ORIGIN},json={'username':'member','password':'correct-horse-member'}).status_code==429
+    # 同一来源轮换账户名仍会耗尽来源桶。
+    for i in range(24):
+        r=client.post('/api/auth/login',headers={'Origin':ALLOWED_ORIGIN},json={'username':f'unknown{i}','password':'wrong-password'})
+        assert r.status_code==401
+    assert client.post('/api/auth/login',headers={'Origin':ALLOWED_ORIGIN},json={'username':'another','password':'wrong-password'}).status_code==429
     with Store(database).connect() as connection:
-        assert connection.execute("SELECT revoked_at FROM sessions WHERE username = 'member'").fetchone()["revoked_at"] is not None
-        assert connection.execute("SELECT outcome FROM audit_events WHERE action = 'logout' ORDER BY id DESC LIMIT 1").fetchone()["outcome"] == "success"
+        addresses={r[0] for r in connection.execute("SELECT DISTINCT source_ip FROM audit_events WHERE action='login'")}
+        assert addresses=={'192.0.2.11'}
 
 
-def test_logout_preserves_a_second_active_session_on_the_same_device(database) -> None:
-    first = client_for(database, principal("member", "member-device", "web-member"))
-    first_csrf = login(first, "member", "correct-horse-member")
-    second = client_for(database, principal("member", "member-device", "web-member"))
-    login(second, "member", "correct-horse-member")
-    assert first.post("/api/auth/logout", headers=csrf(first_csrf)).status_code == 200
-    still_active = second.get("/api/auth/me", headers={"Origin": ALLOWED_ORIGIN})
-    assert still_active.status_code == 200
-    assert still_active.json()["username"] == "member"
-
-
-def test_user_can_only_list_and_revoke_own_devices(database) -> None:
-    member = client_for(database, principal("member", "member-device", "web-member"))
-    csrf_token = login(member, "member", "correct-horse-member")
-    listed = member.get("/api/devices")
-    assert listed.status_code == 200
-    assert [item["account_id"] for item in listed.json()] == ["member"]
-    forbidden = member.post("/api/devices/admin-device/revoke", headers=csrf(csrf_token))
-    assert forbidden.status_code == 404
-    revoked = member.post("/api/devices/member-device/revoke", headers=csrf(csrf_token))
-    assert revoked.status_code == 200
-    assert revoked.json()["state"] == "revoking"
-    assert revoked.json()["gateway_revocation"] == "pending"
-
-
-def test_reservation_rejects_same_or_cross_purpose_certificate_ids_without_partial_record(database) -> None:
-    admin = client_for(database, principal("adminone", "admin-device", "web-admin"))
-    csrf_token = login(admin, "adminone", "correct-horse-admin-one")
-    before = Store(database).list_devices("member")
-    same_id = admin.post(
-        "/api/admin/users/member/devices/reservations",
-        headers=csrf(csrf_token),
-        json={"device_id": "same-id", "vpn_certificate_id": "shared-id", "web_certificate_id": "shared-id"},
-    )
-    assert same_id.status_code == 409
-    assert same_id.json()["error"]["code"] == "device_conflict"
-    cross_account_exchange = admin.post(
-        "/api/admin/users/member/devices/reservations",
-        headers=csrf(csrf_token),
-        json={"device_id": "cross-purpose", "vpn_certificate_id": "web-admin", "web_certificate_id": "vpn-admin"},
-    )
-    assert cross_account_exchange.status_code == 409
-    assert cross_account_exchange.json()["error"]["code"] == "device_conflict"
-    assert Store(database).list_devices("member") == before
-
-
-def test_revoking_device_denies_manager_immediately_and_keeps_gateway_pending(database) -> None:
-    member = client_for(database, principal("member", "member-device", "web-member"))
-    login(member, "member", "correct-horse-member")
-    admin = client_for(database, principal("adminone", "admin-device", "web-admin"))
-    token = login(admin, "adminone", "correct-horse-admin-one")
-    revoked = admin.post("/api/admin/users/member/devices/member-device/revoke", headers=csrf(token))
-    assert revoked.status_code == 200
-    assert revoked.json()["state"] == "revoking"
-    assert revoked.json()["manager_access"] == "revoked"
-    assert revoked.json()["gateway_revocation"] == "pending"
-    assert member.get("/api/auth/me", headers={"Origin": ALLOWED_ORIGIN}).status_code == 403
-    with Store(database).connect() as connection:
-        assert connection.execute("SELECT revoked_at FROM sessions WHERE username = 'member'").fetchone()["revoked_at"] is not None
-
-
-def test_quota_counts_pending_active_and_revoking_under_real_concurrent_reservations(database) -> None:
-    for index, state in enumerate(["pending"] * 6 + ["active", "revoking"]):
-        enroll(database, "member", f"quota-{index}", f"vpn-quota-{index}", f"web-quota-{index}", state)
-    barrier = Barrier(2)
-
-    def reserve(index: int) -> str:
+def test_quota_is_atomic_and_removed_records_release_slots(database):
+    store=Store(database)
+    for i in range(9):store.register_device('member',f'pc-{i}')
+    barrier=Barrier(2)
+    def register(i):
         barrier.wait()
         try:
-            Store(database).reserve_device("member", f"race-{index}", f"vpn-race-{index}", f"web-race-{index}")
-            return "reserved"
-        except DeviceQuotaExceeded:
-            return "quota"
-
+            Store(database).register_device('member',f'race-{i}')
+            return 'added'
+        except DeviceQuotaExceeded:return 'full'
     with ThreadPoolExecutor(max_workers=2) as pool:
-        outcomes = list(pool.map(reserve, (1, 2)))
-    assert sorted(outcomes) == ["quota", "reserved"]
-    assert len(Store(database).list_devices("member")) == 10
+        assert sorted(pool.map(register,(1,2)))==['added','full']
+    store.remove_device('member','pc-0')
+    store.register_device('member','replacement')
+    assert sum(r['state']=='registered' for r in store.list_devices('member'))==10
 
 
-def test_v1_migration_revokes_unbound_sessions(tmp_path) -> None:
-    database = tmp_path / "v1.sqlite3"
-    with sqlite3.connect(database) as connection:
-        connection.executescript(
-            """
-            CREATE TABLE schema_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            INSERT INTO schema_metadata VALUES ('schema_version', '1');
-            CREATE TABLE users (username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, role TEXT NOT NULL, active INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-            INSERT INTO users VALUES ('legacy', 'hash', 'admin', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
-            CREATE TABLE user_networks (username TEXT NOT NULL, network TEXT NOT NULL, PRIMARY KEY (username, network));
-            CREATE TABLE sessions (token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, csrf_hash TEXT NOT NULL, expires_at TEXT NOT NULL, revoked_at TEXT, created_at TEXT NOT NULL);
-            INSERT INTO sessions VALUES ('old', 'legacy', 'csrf', '2099-01-01T00:00:00Z', NULL, '2026-01-01T00:00:00Z');
-            CREATE TABLE login_attempts (source_ip TEXT NOT NULL, username TEXT NOT NULL, window_started_at TEXT NOT NULL, failure_count INTEGER NOT NULL, PRIMARY KEY (source_ip, username));
-            CREATE TABLE audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, occurred_at TEXT NOT NULL, actor TEXT, source_ip TEXT, action TEXT NOT NULL, target TEXT, outcome TEXT NOT NULL);
-            """
-        )
-    Store(database).initialize()
-    with sqlite3.connect(database) as connection:
-        assert connection.execute("SELECT value FROM schema_metadata WHERE key = 'schema_version'").fetchone()[0] == "2"
-        old_session = connection.execute("SELECT device_id, web_certificate_id, revoked_at FROM sessions WHERE token_hash = 'old'").fetchone()
-        assert old_session[0] is None and old_session[1] is None and old_session[2] is not None
+@pytest.mark.parametrize('operation', ['create', 'update'])
+def test_admin_revocation_wins_over_an_inflight_password_change(database, monkeypatch, operation):
+    import vpn_manager.app as module
+    first, second = client_for(database), client_for(database)
+    first_csrf = login(first)
+    assert first.post('/api/admin/users', headers=csrf(first_csrf), json={
+        'username':'admintwo','password':'correct-horse-admin-two','role':'admin','networks':['work']
+    }).status_code == 201
+    second_csrf = login(second, 'admintwo', 'correct-horse-admin-two')
+    entered, release = Event(), Event()
+    original_hash = module.hash_password
+    def paused_hash(value):
+        result = original_hash(value)
+        if value == 'inflight-change-password':
+            entered.set()
+            assert release.wait(10), '测试同步屏障超时'
+        return result
+    monkeypatch.setattr(module, 'hash_password', paused_hash)
+    before = Store(database).find_user('member')['password_hash']
+    def request():
+        if operation == 'create':
+            return first.post('/api/admin/users', headers=csrf(first_csrf), json={
+                'username':'unwantedadmin','password':'inflight-change-password','role':'admin','networks':['home']
+            })
+        return first.patch('/api/admin/users/member', headers=csrf(first_csrf), json={'password':'inflight-change-password'})
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(request)
+        try:
+            assert entered.wait(10)
+            assert second.patch('/api/admin/users/adminone', headers=csrf(second_csrf), json={'role':'user'}).status_code == 200
+        finally:
+            release.set()
+        assert pending.result(timeout=10).status_code == 401
+    assert Store(database).find_user('unwantedadmin') is None
+    assert Store(database).find_user('member')['password_hash'] == before
+
+
+@pytest.mark.parametrize('change', ['password', 'deactivate'])
+def test_login_rechecks_credentials_and_account_state_before_committing(database, monkeypatch, change):
+    import vpn_manager.app as module
+    client = client_for(database)
+    entered, release = Event(), Event()
+    original_verify = module.verify_password
+    def paused_verify(encoded, value):
+        result = original_verify(encoded, value)
+        entered.set()
+        assert release.wait(10)
+        return result
+    monkeypatch.setattr(module, 'verify_password', paused_verify)
+    replacement = hash_password('changed-during-login')
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(client.post, '/api/auth/login', headers={'Origin':ALLOWED_ORIGIN}, json={'username':'member','password':'correct-horse-member'})
+        try:
+            assert entered.wait(10)
+            with Store(database).write_transaction() as connection:
+                if change == 'password':
+                    connection.execute("UPDATE users SET password_hash=? WHERE username='member'", (replacement,))
+                else:
+                    connection.execute("UPDATE users SET active=0 WHERE username='member'")
+        finally:
+            release.set()
+        assert pending.result(timeout=10).status_code == 401
+    with Store(database).connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM sessions WHERE username='member'").fetchone()[0] == 0
+
+
+def test_account_limit_survives_source_rotation_and_pair_limit_is_atomic(database):
+    app = create_app(database)
+    for i in range(20):
+        client = TestClient(app, base_url=ALLOWED_ORIGIN, client=(f'192.0.2.{i+1}',12345))
+        assert client.post('/api/auth/login', headers={'Origin':ALLOWED_ORIGIN}, json={'username':'member','password':'wrong-password'}).status_code == 401
+    client = TestClient(app, base_url=ALLOWED_ORIGIN, client=('192.0.2.100',12345))
+    assert client.post('/api/auth/login', headers={'Origin':ALLOWED_ORIGIN}, json={'username':'member','password':'correct-horse-member'}).status_code == 429
+    with Store(database).write_transaction() as connection:
+        connection.execute("INSERT INTO login_attempts VALUES ('192.0.2.200','unknown',?,4)", (utc_text(),))
+    barrier = Barrier(2)
+    def try_login(_):
+        client = TestClient(app, base_url=ALLOWED_ORIGIN, client=('192.0.2.200',12345))
+        barrier.wait(timeout=10)
+        return client.post('/api/auth/login', headers={'Origin':ALLOWED_ORIGIN}, json={'username':'unknown','password':'wrong-password'}).status_code
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(try_login, (1,2))) == [401,429]
+
+
+def create_legacy_database(path, version):
+    password_hash=hash_password('correct-horse-legacy')
+    with sqlite3.connect(path) as c:
+        c.execute('CREATE TABLE schema_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+        c.execute("INSERT INTO schema_metadata VALUES ('schema_version',?)",(str(version),))
+        c.execute('CREATE TABLE users(username TEXT PRIMARY KEY,password_hash TEXT NOT NULL,role TEXT NOT NULL,active INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)')
+        c.execute('INSERT INTO users VALUES (?,?,?,1,?,?)',('legacy',password_hash,'admin',utc_text(),utc_text()))
+        c.execute('CREATE TABLE user_networks(username TEXT,network TEXT,PRIMARY KEY(username,network))')
+        c.execute("INSERT INTO user_networks VALUES ('legacy','work')")
+        suffix=',device_id TEXT NOT NULL,web_certificate_id TEXT NOT NULL' if version>1 else ''
+        c.execute('CREATE TABLE sessions(token_hash TEXT PRIMARY KEY,username TEXT NOT NULL,csrf_hash TEXT NOT NULL,expires_at TEXT NOT NULL,revoked_at TEXT,created_at TEXT NOT NULL'+suffix+')')
+        values=[token_hash('old-cookie'),'legacy','csrf','2099-01-01T00:00:00Z',None,utc_text()]+(['old-device','old-certificate'] if version>1 else [])
+        c.execute('INSERT INTO sessions VALUES ('+','.join('?' for _ in values)+')',values)
+        c.execute('CREATE TABLE devices(account_id TEXT,device_id TEXT,state TEXT,created_at TEXT,updated_at TEXT,PRIMARY KEY(account_id,device_id))')
+        for device_id, state in [('old-active','active'),('old-revoked','revoked')]:
+            c.execute('INSERT INTO devices VALUES (?,?,?,?,?)', ('legacy',device_id,state,utc_text(),utc_text()))
+        c.execute('CREATE TABLE audit_events(id INTEGER PRIMARY KEY AUTOINCREMENT,occurred_at TEXT NOT NULL,actor TEXT,source_ip TEXT,action TEXT NOT NULL,target TEXT,outcome TEXT NOT NULL)')
+        c.execute("INSERT INTO audit_events(occurred_at,actor,source_ip,action,target,outcome) VALUES (?,'legacy','192.0.2.1','historical_login','legacy','success')", (utc_text(),))
+        if version == 3:
+            # 证书旧表仅作为历史保留；新认证不读它。
+            c.execute('CREATE TABLE device_certificates(certificate_id TEXT PRIMARY KEY,purpose TEXT,status TEXT)')
+            c.execute("INSERT INTO device_certificates VALUES ('old-certificate','web','active')")
+
+
+@pytest.mark.parametrize('version',[1,2,3])
+def test_migration_retains_accounts_history_and_rejects_old_sessions(tmp_path,version):
+    path=tmp_path/f'v{version}.sqlite3'
+    create_legacy_database(path, version)
+    app=create_app(path)
+    client=TestClient(app,base_url=ALLOWED_ORIGIN)
+    client.cookies.set(COOKIE_NAME,'old-cookie')
+    assert client.get('/api/auth/me').status_code==401
+    login(client,'legacy','correct-horse-legacy')
+    Store(path).initialize()
+    assert client.get('/api/auth/me').status_code==200
+    with Store(path).connect() as c:
+        assert c.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0]=='4'
+        assert c.execute('SELECT revoked_at FROM sessions WHERE token_hash=?',(token_hash('old-cookie'),)).fetchone()[0]
+        assert c.execute("SELECT COUNT(*) FROM audit_events WHERE action='authentication_schema_upgrade'").fetchone()[0]==1
+        assert c.execute("SELECT COUNT(*) FROM audit_events WHERE action='historical_login'").fetchone()[0] == 1
+        assert c.execute('SELECT COUNT(*) FROM devices').fetchone()[0] == 2
+        records = {r['device_id']:r['state'] for r in c.execute('SELECT * FROM device_records')}
+        assert records == {'old-active':'registered','old-revoked':'removed'}
+        if version == 3:
+            assert tuple(c.execute('SELECT * FROM device_certificates').fetchone()) == ('old-certificate','web','active')
+
+
+def test_migration_failure_rolls_back_schema_and_old_session_revocation(tmp_path, monkeypatch):
+    path = tmp_path/'rollback.sqlite3'
+    create_legacy_database(path, 3)
+    with sqlite3.connect(path) as c:
+        before = list(c.iterdump())
+    def failing_audit(*args, **kwargs):
+        raise RuntimeError('注入迁移失败')
+    monkeypatch.setattr(Store, 'audit', staticmethod(failing_audit))
+    with pytest.raises(RuntimeError, match='注入迁移失败'):
+        Store(path).initialize()
+    with sqlite3.connect(path) as c:
+        assert list(c.iterdump()) == before
+        assert c.execute('SELECT revoked_at FROM sessions').fetchone()[0] is None
+
+
+def test_unknown_or_unversioned_database_is_rejected_without_schema_rewrite(tmp_path):
+    path = tmp_path/'unknown.sqlite3'
+    with sqlite3.connect(path) as c:
+        c.execute('CREATE TABLE unrelated(value TEXT)')
+    with pytest.raises(RuntimeError, match='缺少结构版本'):
+        Store(path).initialize()
+    with sqlite3.connect(path) as c:
+        assert [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")] == ['unrelated']
+
+
+def test_body_limit_static_headers_and_unconnected_gateway(database):
+    from pathlib import Path
+    client=TestClient(create_app(database,web_directory=Path(__file__).resolve().parents[1]/'web'),base_url=ALLOWED_ORIGIN)
+    assert client.get('/').status_code==200
+    assert client.get('/app.js').headers['cache-control']=='no-store'
+    assert client.post('/api/auth/login',content='a'*17000).status_code==413
+    assert client.get('/api/vpn/status').status_code==401
+    login(client)
+    response=client.get('/api/vpn/status')
+    assert response.status_code==503 and response.json()['error']['code']=='gateway_unavailable'

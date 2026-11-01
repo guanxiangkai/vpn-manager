@@ -1,19 +1,20 @@
-# 路由依赖定义在 create_app 内，注解需立即求值以保留局部 Depends 引用。
-
+# 工厂内部依赖的注解需要立即求值，不能启用 postponed annotations。
 import sqlite3
+from datetime import datetime, timedelta
 from ipaddress import ip_address
-from datetime import timedelta
 from pathlib import Path
+from threading import BoundedSemaphore
 from typing import Annotated, Any
+from urllib.parse import urlsplit
 
 from fastapi import Cookie, Depends, FastAPI, Header, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.staticfiles import StaticFiles
 
-from .device_verification import DeviceVerifier, VerifiedDevicePrincipal
-from .models import AuditPage, DeviceReserve, DeviceView, ErrorResponse, LoginRequest, LoginResponse, MeResponse, MessageResponse, UserCreate, UserUpdate, UserView
-from .security import COOKIE_NAME, SESSION_TTL, hash_password, needs_rehash, new_secret, utc_now, utc_text, verify_password
+from .models import AuditPage, DeviceCreate, DeviceView, ErrorResponse, LoginRequest, LoginResponse, MeResponse, MessageResponse, UserCreate, UserUpdate, UserView
+from .security import COOKIE_NAME, SESSION_TTL, hash_password, needs_rehash, new_secret, token_hash, utc_now, utc_text, verify_password
 from .store import DeviceConflict, DeviceQuotaExceeded, Store
 
 ALLOWED_ORIGIN = "https://slimjoy.cn"
@@ -24,266 +25,218 @@ MAX_REQUEST_BODY_BYTES = 16 * 1024
 
 class ApiError(Exception):
     def __init__(self, status_code: int, code: str, message: str) -> None:
-        self.status_code = status_code
-        self.code = code
-        self.message = message
+        self.status_code, self.code, self.message = status_code, code, message
 
 
-def public_device(device: dict[str, Any]) -> dict[str, Any]:
-    state = device["state"]
-    manager_access = "allowed" if state == "active" else "revoked"
-    gateway_revocation = "pending" if state == "revoking" else ("acknowledged" if state == "revoked" else "not_requested")
-    return {**device, "manager_access": manager_access, "gateway_revocation": gateway_revocation}
-
-
-class BoundedBodyMiddleware:
-    """在 FastAPI 解析 JSON 前，只缓存大小受限的 HTTP 请求体。"""
-
-    def __init__(self, app: Any, max_bytes: int) -> None:
-        self.app = app
-        self.max_bytes = max_bytes
-
-    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-        raw_length = next((value for key, value in scope.get("headers", []) if key == b"content-length"), None)
-        if raw_length is not None:
-            try:
-                if int(raw_length) > self.max_bytes:
-                    await self._too_large(send)
-                    return
-            except ValueError:
-                await self._invalid_length(send)
-                return
-        events: list[dict[str, Any]] = []
-        size = 0
-        while True:
-            event = await receive()
-            events.append(event)
-            if event["type"] == "http.request":
-                size += len(event.get("body", b""))
-                if size > self.max_bytes:
-                    await self._too_large(send)
-                    return
-                if not event.get("more_body", False):
-                    break
-            elif event["type"] == "http.disconnect":
-                break
-
-        async def replay() -> dict[str, Any]:
-            if events:
-                return events.pop(0)
-            return {"type": "http.request", "body": b"", "more_body": False}
-
-        await self.app(scope, replay, send)
-
-    @staticmethod
-    async def _send_error(send: Any, code: str, message: str, status: int) -> None:
-        payload = f'{{"error":{{"code":"{code}","message":"{message}"}}}}'.encode("utf-8")
-        await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(payload)).encode("ascii"))]})
-        await send({"type": "http.response.body", "body": payload})
-
-    async def _too_large(self, send: Any) -> None:
-        await self._send_error(send, "request_too_large", "请求体过大。", 413)
-
-    async def _invalid_length(self, send: Any) -> None:
-        await self._send_error(send, "invalid_request", "请求无效。", 400)
-
-
-class DefaultDeviceLockMiddleware:
-    """未配置真实证书验证器时，在路由执行前拒绝访问。"""
-
-    def __init__(self, app: Any) -> None:
-        self.app = app
-
-    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope["type"] == "http" and scope["path"].startswith("/api/") and scope["app"].state.device_verifier is None:
-            payload = '{"error":{"code":"device_verification_unavailable","message":"尚未配置设备验证服务。"}}'.encode("utf-8")
-            await send({"type": "http.response.start", "status": 503, "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(payload)).encode("ascii"))]})
-            await send({"type": "http.response.body", "body": payload})
-            return
-        await self.app(scope, receive, send)
-
-
-def source_ip(request: Request) -> str | None:
-    # 不使用 X-Forwarded-For 等可受代理控制的请求头判断来源。
-    return request.client.host if request.client else None
+def source_ip(request: Request) -> str:
+    # 直连 HTTPS 使用真实 TCP 地址；绝不相信客户端自报的 XFF。
+    try:
+        return str(ip_address(request.client.host)) if request.client else "unknown"
+    except ValueError:
+        return "unknown"
 
 
 def public_user(user: dict[str, Any]) -> dict[str, Any]:
-    return {key: user[key] for key in ("username", "role", "networks", "active", "created_at", "updated_at")}
+    return {k: user[k] for k in ("username", "role", "networks", "active", "created_at", "updated_at")}
 
 
 def require_origin(request: Request) -> None:
-    if request.headers.get("origin") != ALLOWED_ORIGIN:
+    if request.headers.get("origin") != request.app.state.allowed_origin:
         raise ApiError(403, "origin_forbidden", "请求来源不被允许。")
 
 
-def create_app(database_path: str | Path = "./slimjoy-vpn-manager.sqlite3", device_verifier: DeviceVerifier | None = None) -> FastAPI:
-    """创建应用并显式初始化数据库；导入模块时不执行初始化。"""
+class RequestBoundaryMiddleware:
+    """请求体上限和响应安全头；身份认证由账户密码及服务端会话完成。"""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def secured_send(event):
+            if event["type"] == "http.response.start":
+                headers = [(k,v) for k,v in event.get("headers",[]) if k.lower() not in {b"cache-control",b"content-security-policy"}]
+                headers.extend([(b"cache-control",b"no-store"),(b"x-content-type-options",b"nosniff"),(b"referrer-policy",b"no-referrer"),
+                    (b"content-security-policy", b"default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")])
+                event = {**event,"headers":headers}
+            await send(event)
+
+        async def error(status, code, message):
+            await JSONResponse({"error":{"code":code,"message":message}}, status_code=status)(scope,receive,secured_send)
+
+        lengths = [v for k,v in scope.get("headers",[]) if k.lower()==b"content-length"]
+        try:
+            if len(lengths)>1 or lengths and (not lengths[0].isdigit() or int(lengths[0])<0):
+                raise ValueError()
+            if lengths and int(lengths[0])>MAX_REQUEST_BODY_BYTES:
+                await error(413,"request_too_large","请求体过大。")
+                return
+        except ValueError:
+            await error(400,"invalid_request","请求无效。")
+            return
+        events, size = [], 0
+        while True:
+            event = await receive()
+            events.append(event)
+            if event["type"] == "http.disconnect":
+                return
+            size += len(event.get("body",b""))
+            if size>MAX_REQUEST_BODY_BYTES:
+                await error(413,"request_too_large","请求体过大。")
+                return
+            if not event.get("more_body",False):
+                break
+        async def replay():
+            return events.pop(0) if events else {"type":"http.request","body":b"","more_body":False}
+        await self.app(scope,replay,secured_send)
+
+
+def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_origin: str = ALLOWED_ORIGIN, web_directory: str | Path | None = None) -> FastAPI:
+    origin = urlsplit(allowed_origin)
+    if origin.scheme!="https" or not origin.hostname or origin.username or origin.password or origin.path or origin.query or origin.fragment:
+        raise ValueError("管理入口必须是无路径的 HTTPS 来源")
+    _ = origin.port
     store = Store(database_path)
     store.initialize()
-    app = FastAPI(title="VPN 管理器", docs_url=None, redoc_url=None, openapi_url=None)
-    app.state.store = store
-    app.state.device_verifier = device_verifier
-    app.add_middleware(BoundedBodyMiddleware, max_bytes=MAX_REQUEST_BODY_BYTES)
-    app.add_middleware(DefaultDeviceLockMiddleware)
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[ALLOWED_ORIGIN],
-        allow_credentials=True,
-        allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
-        allow_headers=["Content-Type", "X-CSRF-Token"],
-        max_age=600,
-    )
+    app = FastAPI(title="VPN 管理器",docs_url=None,redoc_url=None,openapi_url=None)
+    app.state.store, app.state.allowed_origin = store, allowed_origin
+    app.add_middleware(CORSMiddleware,allow_origins=[allowed_origin],allow_credentials=True,allow_methods=["GET","POST","PATCH","OPTIONS"],allow_headers=["Content-Type","X-CSRF-Token"],max_age=600)
+    app.add_middleware(RequestBoundaryMiddleware)
+    password_slots = BoundedSemaphore(2)
+    dummy_hash = hash_password(new_secret())
 
     @app.exception_handler(ApiError)
-    async def api_error_handler(_: Request, error: ApiError) -> JSONResponse:
-        return JSONResponse(content={"error": {"code": error.code, "message": error.message}}, status_code=error.status_code)
+    async def api_error_handler(_,error):
+        return JSONResponse({"error":{"code":error.code,"message":error.message}},status_code=error.status_code)
 
     @app.exception_handler(RequestValidationError)
-    async def validation_error_handler(_: Request, __: RequestValidationError) -> JSONResponse:
-        return JSONResponse(content={"error": {"code": "invalid_request", "message": "请求无效。"}}, status_code=422)
+    async def invalid_request(_,__):
+        return JSONResponse({"error":{"code":"invalid_request","message":"请求无效。"}},status_code=422)
 
-    def current_device(request: Request) -> VerifiedDevicePrincipal:
-        verifier = app.state.device_verifier
-        if verifier is None:
-            raise ApiError(503, "device_verification_unavailable", "尚未配置设备验证服务。")
-        principal = verifier.verify(request)
-        if principal is None:
-            raise ApiError(403, "device_verification_required", "需要经过验证的管理设备。")
-        if store.active_device(principal) is None:
-            raise ApiError(403, "device_not_active", "此管理设备尚未启用或已被撤销。")
-        return principal
+    @app.exception_handler(sqlite3.Error)
+    async def database_unavailable(_,__):
+        return JSONResponse({"error":{"code":"service_unavailable","message":"服务暂不可用，请稍后重试。"}},status_code=503)
 
-    def current_user(device: Annotated[VerifiedDevicePrincipal, Depends(current_device)], session_token: Annotated[str | None, Cookie(alias=COOKIE_NAME)] = None) -> dict[str, Any]:
-        if not session_token:
-            raise ApiError(401, "authentication_required", "请先登录。")
-        user = store.session_user(session_token, device)
+    def current_user(session_token: Annotated[str | None,Cookie(alias=COOKIE_NAME)] = None):
+        user = store.session_user(session_token) if session_token else None
         if user is None:
-            raise ApiError(401, "authentication_required", "请先登录。")
+            raise ApiError(401,"authentication_required","请先登录。")
         return user
 
-    def csrf_protected(
-        request: Request,
-        device: Annotated[VerifiedDevicePrincipal, Depends(current_device)],
-        user: Annotated[dict[str, Any], Depends(current_user)],
-        session_token: Annotated[str | None, Cookie(alias=COOKIE_NAME)] = None,
-        csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
-    ) -> dict[str, Any]:
+    def csrf_protected(request: Request,user: Annotated[dict,Depends(current_user)],session_token: Annotated[str | None,Cookie(alias=COOKIE_NAME)] = None,csrf_token: Annotated[str | None,Header(alias="X-CSRF-Token")] = None):
         require_origin(request)
-        if session_token is None or csrf_token is None or not store.csrf_valid(session_token, csrf_token, device):
+        if not session_token or not csrf_token or not store.csrf_valid(session_token,csrf_token):
+            raise ApiError(403,"csrf_invalid","CSRF 校验失败，请刷新页面后重试。")
+        return user
+
+    def admin_user(request: Request,user: Annotated[dict,Depends(current_user)]):
+        if user["role"]!="admin":
+            with store.write_transaction() as connection:
+                store.audit(connection,actor=user["username"],source_ip=source_ip(request),action="admin_access",target=request.url.path,outcome="denied")
+            raise ApiError(403,"permission_denied","需要管理员权限。")
+        return user
+
+    def admin_mutation_user(request: Request,user: Annotated[dict,Depends(csrf_protected)]):
+        return admin_user(request,user)
+
+    def authorize_write(connection, request: Request, *, admin: bool = False):
+        # 与写入共用事务，防止依赖检查之后的撤权被正在处理的请求绕过。
+        token = request.cookies.get(COOKIE_NAME)
+        user = store.session_user_in_transaction(connection, token) if token else None
+        if user is None:
+            raise ApiError(401, "authentication_required", "请重新登录。")
+        csrf_token = request.headers.get("X-CSRF-Token")
+        if not csrf_token or connection.execute("SELECT 1 FROM sessions WHERE token_hash=? AND csrf_hash=?", (token_hash(token), token_hash(csrf_token))).fetchone() is None:
             raise ApiError(403, "csrf_invalid", "CSRF 校验失败，请刷新页面后重试。")
-        return user
-
-    def admin_user(request: Request, user: Annotated[dict[str, Any], Depends(current_user)]) -> dict[str, Any]:
-        if user["role"] != "admin":
-            with store.write_transaction() as connection:
-                store.audit(connection, actor=user["username"], source_ip=source_ip(request), action="admin_access", target=request.url.path, outcome="denied")
+        if admin and user["role"] != "admin":
             raise ApiError(403, "permission_denied", "需要管理员权限。")
         return user
 
-    def admin_mutation_user(
-        request: Request,
-        user: Annotated[dict[str, Any], Depends(csrf_protected)],
-    ) -> dict[str, Any]:
-        if user["role"] != "admin":
-            with store.write_transaction() as connection:
-                store.audit(connection, actor=user["username"], source_ip=source_ip(request), action="admin_access", target=request.url.path, outcome="denied")
-            raise ApiError(403, "permission_denied", "需要管理员权限。")
-        return user
+    @app.get("/health",response_model=MessageResponse)
+    def health():
+        return {"message":"ok"}
 
-    @app.get("/health", response_model=MessageResponse)
-    def health(request: Request) -> dict[str, str]:
-        try:
-            is_loopback = request.client is not None and ip_address(request.client.host).is_loopback
-        except ValueError:
-            is_loopback = False
-        if not is_loopback:
-            raise ApiError(404, "not_found", "未找到请求的资源。")
-        return {"message": "ok"}
-
-    @app.post("/api/auth/login", response_model=LoginResponse, responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}, 429: {"model": ErrorResponse}})
-    def login(payload: LoginRequest, request: Request, response: Response, device: Annotated[VerifiedDevicePrincipal, Depends(current_device)]) -> dict[str, Any]:
+    @app.post("/api/auth/login",response_model=LoginResponse)
+    def login(payload: LoginRequest,request: Request,response: Response):
         require_origin(request)
-        if payload.username != device.account_id:
-            raise ApiError(403, "device_account_mismatch", "已验证设备未绑定此账户。")
-        now = utc_now()
-        ip = source_ip(request)
-        token, csrf = new_secret(), new_secret()
-        login_error: ApiError | None = None
-        user: dict[str, Any] | None = None
+        now, address = utc_now(), source_ip(request)
+        limited = False
         with store.write_transaction() as connection:
-            attempt = connection.execute(
-                "SELECT * FROM login_attempts WHERE source_ip IS ? AND username = ?", (ip, payload.username)
-            ).fetchone()
-            if attempt is not None:
-                started = attempt["window_started_at"].replace("Z", "+00:00")
-                from datetime import datetime
-                if now - datetime.fromisoformat(started) >= LOGIN_WINDOW:
-                    connection.execute("DELETE FROM login_attempts WHERE source_ip IS ? AND username = ?", (ip, payload.username))
-                    attempt = None
-                elif attempt["failure_count"] >= LOGIN_ATTEMPT_LIMIT:
-                    store.audit(connection, actor=payload.username, source_ip=ip, action="login", target=payload.username, outcome="failure")
-                    login_error = ApiError(429, "rate_limited", "登录尝试次数过多，请稍后重试。")
-            if login_error is None:
-                row = connection.execute("SELECT * FROM users WHERE username = ?", (payload.username,)).fetchone()
-                user = store.user_from_row(connection, row)
-                valid = user is not None and user["active"] and verify_password(user["password_hash"], payload.password.get_secret_value())
-            else:
-                valid = False
-            if login_error is None and not valid:
-                if attempt is None:
-                    connection.execute("INSERT INTO login_attempts(source_ip, username, window_started_at, failure_count) VALUES (?, ?, ?, 1)", (ip, payload.username, utc_text(now)))
+            # 三个桶先占位再做昂贵哈希，避免并发绕过或换用户名绕过来源限流。
+            buckets = ((address,payload.username,LOGIN_ATTEMPT_LIMIT),(address,"@source",30),("*",payload.username,20))
+            for source,name,limit in buckets:
+                row = connection.execute("SELECT * FROM login_attempts WHERE source_ip=? AND username=?",(source,name)).fetchone()
+                expired = row is None or datetime.fromisoformat(row["window_started_at"].replace("Z","+00:00")) + LOGIN_WINDOW <= now
+                count = 0 if expired else row["failure_count"]
+                if count>=limit:
+                    limited = True
                 else:
-                    connection.execute("UPDATE login_attempts SET failure_count = failure_count + 1 WHERE source_ip IS ? AND username = ?", (ip, payload.username))
-                store.audit(connection, actor=payload.username, source_ip=ip, action="login", target=payload.username, outcome="failure")
-                login_error = ApiError(401, "invalid_credentials", "账户名或密码错误。")
-            if login_error is None:
-                assert user is not None
-                connection.execute("DELETE FROM login_attempts WHERE source_ip IS ? AND username = ?", (ip, payload.username))
-                if needs_rehash(user["password_hash"]):
-                    connection.execute("UPDATE users SET password_hash = ?, updated_at = ? WHERE username = ?", (hash_password(payload.password.get_secret_value()), utc_text(), user["username"]))
-                    user = store.user_from_row(connection, connection.execute("SELECT * FROM users WHERE username = ?", (user["username"],)).fetchone())
-                store.add_session_in_transaction(connection, user["username"], device, token, csrf, now + SESSION_TTL)
-                store.audit(connection, actor=user["username"], source_ip=ip, action="login", target=user["username"], outcome="success")
-        if login_error is not None:
-            raise login_error
-        assert user is not None
-        response.set_cookie(COOKIE_NAME, token, max_age=int(SESSION_TTL.total_seconds()), httponly=True, secure=True, samesite="lax", path="/")
-        return {"user": public_user(user), "csrf_token": csrf}
-
-    @app.post("/api/auth/logout", response_model=MessageResponse, responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}})
-    def logout(request: Request, response: Response, user: Annotated[dict[str, Any], Depends(csrf_protected)], device: Annotated[VerifiedDevicePrincipal, Depends(current_device)], session_token: Annotated[str | None, Cookie(alias=COOKIE_NAME)] = None) -> dict[str, str]:
-        assert session_token is not None
+                    connection.execute("INSERT INTO login_attempts(source_ip,username,window_started_at,failure_count) VALUES (?,?,?,?) ON CONFLICT(source_ip,username) DO UPDATE SET window_started_at=excluded.window_started_at,failure_count=excluded.failure_count",(source,name,utc_text(now) if expired else row["window_started_at"],count+1))
+            if limited:
+                store.audit(connection,actor=payload.username,source_ip=address,action="login_rate_limited",target=payload.username,outcome="denied")
+        if limited:
+            raise ApiError(429,"login_rate_limited","登录尝试过多，请稍后重试。")
+        if not password_slots.acquire(blocking=False):
+            raise ApiError(429,"login_busy","登录服务繁忙，请稍后重试。")
+        try:
+            candidate = store.find_user(payload.username)
+            checked_hash = candidate["password_hash"] if candidate else dummy_hash
+            valid = verify_password(checked_hash,payload.password.get_secret_value())
+            replacement = hash_password(payload.password.get_secret_value()) if valid and candidate and needs_rehash(checked_hash) else None
+        finally:
+            password_slots.release()
+        token, csrf_token = new_secret(), new_secret()
         with store.write_transaction() as connection:
-            if not store.revoke_session_in_transaction(connection, session_token, device):
-                raise ApiError(401, "authentication_required", "请先登录。")
-            store.audit(connection, actor=user["username"], source_ip=source_ip(request), action="logout", target=user["username"], outcome="success")
-        response.delete_cookie(COOKIE_NAME, path="/")
-        return {"message": "已退出登录"}
+            user = store.user_from_row(connection,connection.execute("SELECT * FROM users WHERE username=?",(payload.username,)).fetchone())
+            accepted = valid and user is not None and user["active"] and user["password_hash"]==checked_hash
+            if not accepted:
+                store.audit(connection,actor=payload.username,source_ip=address,action="login",target=payload.username,outcome="failure")
+            else:
+                if replacement:
+                    connection.execute("UPDATE users SET password_hash=? WHERE username=?",(replacement,payload.username))
+                store.add_session_in_transaction(connection,payload.username,token,csrf_token,now+SESSION_TTL)
+                connection.execute("DELETE FROM login_attempts WHERE source_ip=? AND username=?",(address,payload.username))
+                store.audit(connection,actor=payload.username,source_ip=address,action="login",target=payload.username,outcome="success")
+        if not accepted:
+            raise ApiError(401,"invalid_credentials","账户或密码错误。")
+        response.set_cookie(COOKIE_NAME,token,max_age=int(SESSION_TTL.total_seconds()),httponly=True,secure=True,samesite="lax",path="/")
+        return {"user":public_user(user),"csrf_token":csrf_token}
 
-    @app.get("/api/auth/me", response_model=MeResponse, responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}})
-    def me(request: Request, user: Annotated[dict[str, Any], Depends(current_user)], device: Annotated[VerifiedDevicePrincipal, Depends(current_device)], session_token: Annotated[str | None, Cookie(alias=COOKIE_NAME)] = None) -> dict[str, Any]:
-        # 此 GET 请求会轮换 CSRF 令牌，必须先拒绝跨来源请求。
+    @app.get("/api/auth/me",response_model=UserView)
+    def me(user: Annotated[dict,Depends(current_user)]):
+        return public_user(user)
+
+    @app.post("/api/auth/refresh",response_model=MeResponse)
+    def refresh(request: Request,user: Annotated[dict,Depends(current_user)],session_token: Annotated[str | None,Cookie(alias=COOKIE_NAME)] = None):
         require_origin(request)
-        assert session_token is not None
         csrf_token = new_secret()
-        if not store.rotate_csrf(session_token, csrf_token, device):
-            raise ApiError(401, "authentication_required", "请先登录。")
-        return {**public_user(user), "csrf_token": csrf_token}
+        if not store.rotate_csrf(session_token,csrf_token):
+            raise ApiError(401,"authentication_required","请先登录。")
+        return {**public_user(user),"csrf_token":csrf_token}
 
-    @app.get("/api/devices", response_model=list[DeviceView], responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}})
-    def list_own_devices(user: Annotated[dict[str, Any], Depends(current_user)]) -> list[dict[str, Any]]:
-        return [public_device(item) for item in store.list_devices(user["username"])]
+    @app.post("/api/auth/logout",response_model=MessageResponse)
+    def logout(request: Request,response: Response,user: Annotated[dict,Depends(csrf_protected)],session_token: Annotated[str | None,Cookie(alias=COOKIE_NAME)] = None):
+        with store.write_transaction() as connection:
+            if not store.revoke_session_in_transaction(connection,session_token,user["username"]):
+                raise ApiError(401,"authentication_required","请先登录。")
+            store.audit(connection,actor=user["username"],source_ip=source_ip(request),action="logout",target=user["username"],outcome="success")
+        response.delete_cookie(COOKIE_NAME,path="/",secure=True,httponly=True,samesite="lax")
+        return {"message":"已退出登录"}
 
-    @app.post("/api/devices/{device_id}/revoke", response_model=DeviceView, responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}})
-    def revoke_own_device(device_id: str, request: Request, user: Annotated[dict[str, Any], Depends(csrf_protected)]) -> dict[str, Any]:
-        device = store.mark_device_revoking(user["username"], device_id, actor=user["username"], source_ip=source_ip(request))
-        if device is None:
-            raise ApiError(404, "device_not_found", "未找到设备。")
-        return public_device(device)
+    @app.get("/api/devices",response_model=list[DeviceView])
+    def own_devices(user: Annotated[dict,Depends(current_user)]):
+        return store.list_devices(user["username"])
+
+    @app.post("/api/devices/{device_id}/remove",response_model=DeviceView)
+    def remove_own_device(device_id: str,request: Request,user: Annotated[dict,Depends(csrf_protected)]):
+        with store.write_transaction() as connection:
+            user = authorize_write(connection, request)
+            item = store.remove_device_in_transaction(connection,user["username"],device_id,user["username"],source_ip(request))
+        if item is None:
+            raise ApiError(404,"device_not_found","未找到设备记录。")
+        return item
 
     @app.get("/api/admin/users", response_model=list[UserView], responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}})
     def list_users(_: Annotated[dict[str, Any], Depends(admin_user)]) -> list[dict[str, Any]]:
@@ -291,10 +244,12 @@ def create_app(database_path: str | Path = "./slimjoy-vpn-manager.sqlite3", devi
 
     @app.post("/api/admin/users", response_model=UserView, status_code=201, responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}, 409: {"model": ErrorResponse}})
     def create_user(payload: UserCreate, request: Request, actor: Annotated[dict[str, Any], Depends(admin_mutation_user)]) -> dict[str, Any]:
+        password_hash = hash_password(payload.password.get_secret_value())
         with store.write_transaction() as connection:
+            actor = authorize_write(connection, request, admin=True)
             now = utc_text()
             try:
-                connection.execute("INSERT INTO users(username, password_hash, role, active, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)", (payload.username, hash_password(payload.password.get_secret_value()), payload.role, now, now))
+                connection.execute("INSERT INTO users(username, password_hash, role, active, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)", (payload.username, password_hash, payload.role, now, now))
             except sqlite3.IntegrityError:
                 raise ApiError(409, "username_conflict", "此账户名已存在。")
             connection.executemany("INSERT INTO user_networks(username, network) VALUES (?, ?)", [(payload.username, network) for network in payload.networks])
@@ -310,7 +265,9 @@ def create_app(database_path: str | Path = "./slimjoy-vpn-manager.sqlite3", devi
 
     @app.patch("/api/admin/users/{username}", response_model=UserView, responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}})
     def update_user(username: str, payload: UserUpdate, request: Request, actor: Annotated[dict[str, Any], Depends(admin_mutation_user)]) -> dict[str, Any]:
+        replacement = hash_password(payload.password.get_secret_value()) if payload.password is not None else None
         with store.write_transaction() as connection:
+            actor = authorize_write(connection, request, admin=True)
             current = store.user_from_row(connection, connection.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone())
             if current is None:
                 raise ApiError(404, "user_not_found", "未找到账户。")
@@ -321,7 +278,7 @@ def create_app(database_path: str | Path = "./slimjoy-vpn-manager.sqlite3", devi
             next_networks = payload.networks if payload.networks is not None else current["networks"]
             changed = changed or next_networks != current["networks"] or payload.password is not None
             if changed:
-                password_hash = hash_password(payload.password.get_secret_value()) if payload.password is not None else current["password_hash"]
+                password_hash = replacement if replacement is not None else current["password_hash"]
                 connection.execute("UPDATE users SET password_hash = ?, role = ?, active = ?, updated_at = ? WHERE username = ?", (password_hash, next_role, int(next_active), utc_text(), username))
                 if payload.networks is not None:
                     connection.execute("DELETE FROM user_networks WHERE username = ?", (username,))
@@ -334,6 +291,7 @@ def create_app(database_path: str | Path = "./slimjoy-vpn-manager.sqlite3", devi
     @app.post("/api/admin/users/{username}/deactivate", response_model=UserView, responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}})
     def deactivate_user(username: str, request: Request, actor: Annotated[dict[str, Any], Depends(admin_mutation_user)]) -> dict[str, Any]:
         with store.write_transaction() as connection:
+            actor = authorize_write(connection, request, admin=True)
             current = store.user_from_row(connection, connection.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone())
             if current is None:
                 raise ApiError(404, "user_not_found", "未找到账户。")
@@ -345,34 +303,41 @@ def create_app(database_path: str | Path = "./slimjoy-vpn-manager.sqlite3", devi
             updated = store.user_from_row(connection, connection.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone())
         return public_user(updated)
 
-    @app.get("/api/admin/users/{username}/devices", response_model=list[DeviceView], responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}})
-    def list_devices(username: str, _: Annotated[dict[str, Any], Depends(admin_user)]) -> list[dict[str, Any]]:
-        return [public_device(item) for item in store.list_devices(username)]
+    @app.get("/api/admin/users/{username}/devices",response_model=list[DeviceView])
+    def user_devices(username: str,_: Annotated[dict,Depends(admin_user)]):
+        if store.find_user(username) is None:
+            raise ApiError(404,"user_not_found","未找到账户。")
+        return store.list_devices(username)
 
-    @app.post("/api/admin/users/{username}/devices/reservations", response_model=DeviceView, status_code=201, responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}, 409: {"model": ErrorResponse}})
-    def reserve_device(username: str, payload: DeviceReserve, request: Request, actor: Annotated[dict[str, Any], Depends(admin_mutation_user)]) -> dict[str, Any]:
+    @app.post("/api/admin/users/{username}/devices",response_model=DeviceView,status_code=201)
+    def add_device(username: str,payload: DeviceCreate,request: Request,actor: Annotated[dict,Depends(admin_mutation_user)]):
         try:
-            device = store.reserve_device(username, payload.device_id, payload.vpn_certificate_id, payload.web_certificate_id, actor["username"], source_ip(request))
+            with store.write_transaction() as connection:
+                actor = authorize_write(connection, request, admin=True)
+                return store.register_device_in_transaction(connection,username,payload.device_id,actor["username"],source_ip(request))
         except DeviceQuotaExceeded:
-            raise ApiError(409, "device_quota_exceeded", "每个账户最多登记十台设备。")
+            raise ApiError(409,"device_quota_exceeded","每个账户最多登记十台设备。")
         except DeviceConflict:
-            raise ApiError(409, "device_conflict", "账户、设备或证书登记标识不可用。")
-        return public_device(device)
+            raise ApiError(409,"device_conflict","账户或设备记录不可用。")
 
-    @app.post("/api/admin/users/{username}/devices/{device_id}/revoke", response_model=DeviceView, responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}})
-    def revoke_device(username: str, device_id: str, request: Request, actor: Annotated[dict[str, Any], Depends(admin_mutation_user)]) -> dict[str, Any]:
-        device = store.mark_device_revoking(username, device_id, actor["username"], source_ip(request))
-        if device is None:
-            raise ApiError(404, "device_not_found", "未找到设备。")
-        return public_device(device)
+    @app.post("/api/admin/users/{username}/devices/{device_id}/remove",response_model=DeviceView)
+    def remove_device(username: str,device_id: str,request: Request,actor: Annotated[dict,Depends(admin_mutation_user)]):
+        with store.write_transaction() as connection:
+            actor = authorize_write(connection, request, admin=True)
+            item = store.remove_device_in_transaction(connection,username,device_id,actor["username"],source_ip(request))
+        if item is None:
+            raise ApiError(404,"device_not_found","未找到设备记录。")
+        return item
 
-    @app.get("/api/admin/audit", response_model=AuditPage, responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}})
-    def audit_log(_: Annotated[dict[str, Any], Depends(admin_user)], cursor: int | None = Query(default=None, ge=1), limit: int = Query(default=50, ge=1, le=100)) -> dict[str, Any]:
-        items, next_cursor = store.list_audit(cursor, limit)
-        return {"items": items, "next_cursor": next_cursor}
+    @app.get("/api/admin/audit",response_model=AuditPage)
+    def audit_log(_: Annotated[dict,Depends(admin_user)],cursor: int | None = Query(default=None,ge=1),limit: int = Query(default=50,ge=1,le=100)):
+        items,next_cursor=store.list_audit(cursor,limit)
+        return {"items":items,"next_cursor":next_cursor}
 
-    @app.api_route("/api/vpn/{operation:path}", methods=["GET", "POST", "PATCH", "PUT", "DELETE"], response_model=MessageResponse, responses={401: {"model": ErrorResponse}, 503: {"model": ErrorResponse}})
-    def unavailable_gateway(_: Annotated[dict[str, Any], Depends(current_user)]) -> None:
-        raise ApiError(503, "gateway_unavailable", "测试环境尚未接入 VPN 网关。")
+    @app.api_route("/api/vpn/{operation:path}",methods=["GET","POST","PATCH","PUT","DELETE"])
+    def unavailable_gateway(_: Annotated[dict,Depends(current_user)]):
+        raise ApiError(503,"gateway_unavailable","管理服务尚未接入现有 VPN 网关。")
 
+    if web_directory is not None:
+        app.mount("/",StaticFiles(directory=web_directory,html=True),name="web")
     return app
