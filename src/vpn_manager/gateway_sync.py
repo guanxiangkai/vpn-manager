@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.exceptions import InvalidTag
 
 from .store import Store
 
@@ -131,7 +132,9 @@ def open_credential(private_key_pem: bytes, envelope: dict[str, object], usernam
         if not plaintext or len(plaintext) > 1024:
             raise ValueError("无效的凭据封装")
         return plaintext.decode("utf-8")
-    except (ValueError, UnicodeDecodeError) as error:
+    # AESGCM 认证失败使用 cryptography.exceptions.InvalidTag，而非
+    # ValueError。对调用方统一为同一个非敏感错误，不能暴露信封、密钥或密码线索。
+    except (InvalidTag, ValueError, UnicodeDecodeError) as error:
         raise ValueError("无效的凭据封装") from error
 
 

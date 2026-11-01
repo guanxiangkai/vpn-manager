@@ -104,7 +104,11 @@ def test_gateway_projection_is_queued_atomically_and_never_reported_as_applied(d
     from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
     key = X25519PrivateKey.generate()
     public = key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
-    admin, member = TestClient(create_app(database, gateway_public_key=public), base_url=ALLOWED_ORIGIN), client_for(database)
+    class Gateway:
+        def status(self, username):
+            return {'username': username, 'generation': 0, 'state': 'not_provisioned'}
+
+    admin, member = TestClient(create_app(database, gateway_public_key=public, gateway_client=Gateway()), base_url=ALLOWED_ORIGIN), client_for(database)
     token = login(admin)
     assert login(member, 'member', 'correct-horse-member')
     assert admin.patch('/api/admin/users/member', headers=csrf(token), json={'password':'a-brand-new-password','networks':['work']}).status_code == 200
@@ -114,10 +118,59 @@ def test_gateway_projection_is_queued_atomically_and_never_reported_as_applied(d
     assert job['username'] == 'member' and job['generation'] == 1 and job['state'] == 'queued'
     assert 'a-brand-new-password' not in json.dumps(job)
     status = admin.get('/api/admin/gateway-status').json()
-    assert next(item for item in status if item['username'] == 'member')['state'] == 'queued'
+    assert next(item for item in status if item['username'] == 'member')['state'] == 'not_provisioned'
     store.record_gateway_reply(job['operation_id'], 'member', 1, 'failed', 'gateway_rejected')
     status = admin.get('/api/admin/gateway-status').json()
-    assert next(item for item in status if item['username'] == 'member')['state'] == 'failed'
+    assert next(item for item in status if item['username'] == 'member')['state'] == 'not_provisioned'
+
+
+def test_gateway_status_uses_current_database_generation_not_old_agent_ack(database):
+    class Gateway:
+        def status(self, username):
+            return {'username': username, 'generation': 1, 'state': 'applied'}
+
+    store = Store(database)
+    with store.write_transaction() as connection:
+        first = store.queue_gateway_change(connection, 'adminone', 1, True, ['home'], None)
+    store.record_gateway_reply(first, 'adminone', 1, 'applied', None)
+    with store.write_transaction() as connection:
+        store.queue_gateway_change(connection, 'adminone', 2, True, ['home', 'work'], None)
+    client = TestClient(create_app(database, gateway_client=Gateway()), base_url=ALLOWED_ORIGIN)
+    login(client)
+    personal = client.get('/api/vpn/status')
+    all_accounts = client.get('/api/admin/gateway-status')
+    assert personal.status_code == all_accounts.status_code == 200
+    assert personal.json() == {'username': 'adminone', 'generation': 2, 'applied_generation': 1,
+                               'state': 'queued', 'code': None, 'updated_at': None}
+    assert next(item for item in all_accounts.json() if item['username'] == 'adminone') == personal.json()
+
+
+def test_gateway_restart_pending_and_unavailable_never_claim_applied(database):
+    from vpn_manager.gateway_sync import GatewayUnavailable
+
+    class PendingGateway:
+        def status(self, username):
+            return {'username': username, 'generation': 1, 'state': 'pending', 'code': 'startup_projection'}
+
+    store = Store(database)
+    with store.write_transaction() as connection:
+        job = store.queue_gateway_change(connection, 'adminone', 1, True, ['home'], None)
+    store.record_gateway_reply(job, 'adminone', 1, 'applied', None)
+    client = TestClient(create_app(database, gateway_client=PendingGateway()), base_url=ALLOWED_ORIGIN)
+    login(client)
+    response = client.get('/api/vpn/status')
+    assert response.json()['generation'] == 1
+    assert response.json()['applied_generation'] is None
+    assert response.json()['state'] == 'pending'
+
+    class UnavailableGateway:
+        def status(self, _username):
+            raise GatewayUnavailable()
+
+    unavailable = TestClient(create_app(database, gateway_client=UnavailableGateway()), base_url=ALLOWED_ORIGIN)
+    login(unavailable)
+    assert unavailable.get('/api/vpn/status').status_code == 503
+    assert unavailable.get('/api/admin/gateway-status').status_code == 503
 
 
 def test_user_role_is_work_only_across_create_update_bootstrap_and_downgrade(tmp_path):
@@ -411,3 +464,4 @@ def test_body_limit_static_headers_and_unconnected_gateway(database):
     login(client)
     response=client.get('/api/vpn/status')
     assert response.status_code==503 and response.json()['error']['code']=='gateway_unavailable'
+    assert client.get('/api/admin/gateway-status').status_code==503

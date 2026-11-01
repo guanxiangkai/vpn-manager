@@ -27,8 +27,10 @@ def test_credential_envelope_binds_recipient_account_and_generation():
     envelope = seal_credential(public, "member", 7, "correct-horse-member")
     assert open_credential(private, envelope, "member", 7) == "correct-horse-member"
     assert "correct-horse-member" not in json.dumps(envelope)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="^无效的凭据封装$"):
         open_credential(private, envelope, "member", 8)
+    with pytest.raises(ValueError, match="^无效的凭据封装$"):
+        open_credential(private, envelope, "adminone", 7)
     with pytest.raises(ValueError):
         open_credential(private, {**envelope, "unexpected": True}, "member", 7)
 

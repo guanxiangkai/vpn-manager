@@ -134,6 +134,32 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
         store.queue_gateway_change(connection, username, generation, active, networks, envelope)
         store.audit(connection, actor=None, source_ip=None, action="gateway_sync_queued", target=username, outcome="success")
 
+    def live_gateway_status(username: str) -> dict[str, Any]:
+        """将数据库的当前期望与代理的实际状态合并，绝不以旧 ACK 冒充已生效。"""
+        if gateway_client is None:
+            raise ApiError(503, "gateway_unavailable", "管理服务尚未接入现有 VPN 网关。")
+        try:
+            actual = gateway_client.status(username)
+        except GatewayUnavailable:
+            raise ApiError(503, "gateway_unavailable", "VPN 网关暂不可用。")
+        expected = store.gateway_status(username)
+        expected_generation, actual_generation = expected["generation"], actual["generation"]
+        actual_state = actual["state"]
+        applied_generation = actual_generation if actual_state == "applied" and 1 <= actual_generation <= expected_generation else None
+        if expected_generation == 0:
+            state, code = "not_provisioned", None
+        elif applied_generation == expected_generation:
+            state, code = "applied", actual.get("code")
+        elif actual_state in {"pending", "failed", "not_provisioned", "superseded"}:
+            state, code = actual_state, actual.get("code")
+        else:
+            # 代理仍报告旧版本已应用时，返回最新期望的未完成状态。
+            state = expected["state"] if expected["state"] != "applied" else "pending"
+            code = expected.get("code")
+        return {"username": username, "generation": expected_generation,
+                "applied_generation": applied_generation, "state": state, "code": code,
+                "updated_at": None}
+
     def current_user(session_token: Annotated[str | None,Cookie(alias=COOKIE_NAME)] = None):
         user = store.session_user(session_token) if session_token else None
         if user is None:
@@ -370,18 +396,12 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
 
     @app.get("/api/admin/gateway-status", response_model=list[GatewayStatus])
     def all_gateway_status(_: Annotated[dict, Depends(admin_user)]):
-        return store.list_gateway_statuses()
+        # 每一项都需来自当前代理读回；任一读回失败时整个总表不可用。
+        return [live_gateway_status(item["username"]) for item in store.list_gateway_statuses()]
 
     @app.get("/api/vpn/status", response_model=GatewayStatus)
     def gateway_status(user: Annotated[dict, Depends(current_user)]):
-        if gateway_client is None:
-            raise ApiError(503, "gateway_unavailable", "管理服务尚未接入现有 VPN 网关。")
-        try:
-            reply = gateway_client.status(user["username"])
-        except GatewayUnavailable:
-            raise ApiError(503, "gateway_unavailable", "VPN 网关暂不可用。")
-        state = reply["state"]
-        return {"username": user["username"], "generation": reply["generation"], "applied_generation": reply["generation"] if state == "applied" and reply["generation"] else None, "state": state, "code": reply.get("code"), "updated_at": None}
+        return live_gateway_status(user["username"])
 
     @app.api_route("/api/vpn/{operation:path}",methods=["GET","POST","PATCH","PUT","DELETE"])
     def unavailable_gateway(_: Annotated[dict,Depends(current_user)]):

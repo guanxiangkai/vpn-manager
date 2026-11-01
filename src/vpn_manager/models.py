@@ -93,7 +93,7 @@ class DeviceView(StrictModel):
 
 
 class GatewayStatus(StrictModel):
-    """管理端持久化的网关投影状态；queued 不表示 IKE 已生效。"""
+    """当前期望版本及代理实际投影；只有版本相等的 applied 才表示已生效。"""
 
     username: str
     generation: int = Field(ge=0)
