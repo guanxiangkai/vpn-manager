@@ -32,4 +32,14 @@ jobs:
       - name: 运行接口回归测试
         run: timeout 240 python -m pytest tests/test_api.py -v -p no:cacheprovider
       - name: 运行原生 HTTPS Chromium 验收
-        run: bash tests/run_browser_acceptance.sh
+        run: timeout 240 bash tests/run_browser_acceptance.sh
+        env:
+          VPN_MANAGER_BROWSER_EVIDENCE: .runtime/browser-evidence
+      - name: 保存隔离测试页面截图
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: browser-evidence
+          path: .runtime/browser-evidence/*.png
+          retention-days: 7
+          if-no-files-found: warn
