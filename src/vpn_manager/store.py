@@ -1,7 +1,9 @@
 """账户、密码会话、设备管理记录与审计；设备记录不参与认证。"""
 from __future__ import annotations
 
+import json
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -9,7 +11,7 @@ from typing import Iterator
 
 from .security import token_hash, utc_text
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 MAX_ENROLLED_DEVICES = 10
 
 
@@ -60,7 +62,7 @@ class Store:
             tables = {r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             old = connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone() if "schema_metadata" in tables else None
             version = old[0] if old else None
-            if version not in {None, "1", "2", "3", "4"}:
+            if version not in {None, "1", "2", "3", "4", "5", "6"}:
                 raise RuntimeError("不支持的数据库结构版本")
             if version is None and tables - {"sqlite_sequence"}:
                 raise RuntimeError("已有数据库缺少结构版本，拒绝猜测迁移")
@@ -72,6 +74,9 @@ class Store:
                 "CREATE TABLE IF NOT EXISTS login_attempts (source_ip TEXT NOT NULL, username TEXT NOT NULL, window_started_at TEXT NOT NULL, failure_count INTEGER NOT NULL CHECK(failure_count>=0), PRIMARY KEY(source_ip,username))",
                 "CREATE TABLE IF NOT EXISTS audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, occurred_at TEXT NOT NULL, actor TEXT, source_ip TEXT, action TEXT NOT NULL, target TEXT, outcome TEXT NOT NULL CHECK(outcome IN ('success','failure','denied')))",
                 "CREATE INDEX IF NOT EXISTS audit_events_id_idx ON audit_events(id DESC)",
+                "CREATE TABLE IF NOT EXISTS gateway_accounts (username TEXT PRIMARY KEY REFERENCES users(username) ON DELETE CASCADE, generation INTEGER NOT NULL CHECK(generation>=1), applied_generation INTEGER, state TEXT NOT NULL CHECK(state IN ('queued','pending','applied','failed','superseded')), code TEXT, updated_at TEXT NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS gateway_outbox (operation_id TEXT PRIMARY KEY, username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE, generation INTEGER NOT NULL CHECK(generation>=1), active INTEGER NOT NULL CHECK(active IN (0,1)), networks_json TEXT NOT NULL, credential_envelope TEXT, state TEXT NOT NULL CHECK(state IN ('queued','pending','applied','failed','superseded')), code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(username,generation))",
+                "CREATE INDEX IF NOT EXISTS gateway_outbox_pending_idx ON gateway_outbox(state,created_at)",
             ]
             for sql in statements:
                 connection.execute(sql)
@@ -93,8 +98,21 @@ class Store:
                     SELECT account_id,device_id,CASE WHEN state='revoked' THEN 'removed' ELSE 'registered' END,created_at,updated_at FROM devices""")
             connection.execute("CREATE INDEX IF NOT EXISTS sessions_username_idx ON sessions(username)")
             connection.execute("CREATE INDEX IF NOT EXISTS sessions_expiry_idx ON sessions(expires_at)")
-            if version != "4":
+            if version in {None, "1", "2", "3"}:
                 self.audit(connection, actor=None, source_ip=None, action="authentication_schema_upgrade", target="password_auth_v4", outcome="success")
+            if version == "4":
+                self.audit(connection, actor=None, source_ip=None, action="gateway_schema_upgrade", target="gateway_sync_v5", outcome="success")
+            if version in {"1", "2", "3", "4", "5"}:
+                # 历史版本允许 user 持有 home。升级时将其原子收敛为唯一
+                # 的 work，之后所有公开写入口会拒绝该越权组合。
+                affected_users = [row[0] for row in connection.execute(
+                    "SELECT u.username FROM users u WHERE u.role='user' AND EXISTS(SELECT 1 FROM user_networks n WHERE n.username=u.username AND n.network<>'work')"
+                )]
+                connection.execute("DELETE FROM user_networks WHERE username IN (SELECT username FROM users WHERE role='user')")
+                connection.execute("INSERT INTO user_networks(username,network) SELECT username,'work' FROM users WHERE role='user'")
+                for username in affected_users:
+                    self.revoke_sessions(connection, username)
+                self.audit(connection, actor=None, source_ip=None, action="user_network_policy_upgrade", target="user_work_only_v6", outcome="success")
             connection.execute("INSERT INTO schema_metadata(key,value) VALUES ('schema_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(SCHEMA_VERSION),))
 
     @staticmethod
@@ -174,6 +192,108 @@ class Store:
             return None
         self.audit(connection, actor=actor, source_ip=source_ip, action="device_record_remove", target=f"{account_id}:{device_id}", outcome="success")
         return dict(connection.execute("SELECT * FROM device_records WHERE account_id=? AND device_id=?", (account_id,device_id)).fetchone())
+
+    @staticmethod
+    def next_gateway_generation(connection, username: str) -> int:
+        row = connection.execute("SELECT generation FROM gateway_accounts WHERE username=?", (username,)).fetchone()
+        return (row["generation"] + 1) if row else 1
+
+    def queue_gateway_change(self, connection, username: str, generation: int, active: bool, networks: list[str], credential_envelope: dict | None) -> str:
+        """将完整期望状态原子入队；后续版本会取代尚未执行的旧版本。"""
+        if generation != self.next_gateway_generation(connection, username) or not isinstance(active, bool):
+            raise ValueError("无效网关同步版本")
+        if not isinstance(networks, list) or len(networks) != len(set(networks)) or set(networks) - {"home", "work"} or (active and not networks):
+            raise ValueError("无效网关网络权限")
+        envelope_json = None
+        if credential_envelope is not None:
+            envelope_json = json.dumps(credential_envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            if len(envelope_json.encode("utf-8")) > 8 * 1024:
+                raise ValueError("凭据封装过大")
+        now, operation_id = utc_text(), uuid.uuid4().hex
+        # 密文 AAD 绑定 generation。非密码变更必须保留前一含密文任务，待它先成功后才可应用新策略。
+        if credential_envelope is not None:
+            connection.execute("UPDATE gateway_outbox SET state='superseded', credential_envelope=NULL, updated_at=? WHERE username=? AND state IN ('queued','pending','failed')", (now, username))
+        else:
+            connection.execute("UPDATE gateway_outbox SET state='superseded', credential_envelope=NULL, updated_at=? WHERE username=? AND state IN ('queued','pending','failed') AND credential_envelope IS NULL", (now, username))
+        connection.execute("INSERT INTO gateway_outbox(operation_id,username,generation,active,networks_json,credential_envelope,state,created_at,updated_at) VALUES (?,?,?,?,?,?, 'queued',?,?)", (operation_id, username, generation, int(active), json.dumps(sorted(networks), separators=(",", ":")), envelope_json, now, now))
+        blocking = connection.execute("SELECT code FROM gateway_outbox WHERE username=? AND credential_envelope IS NOT NULL AND state='failed' ORDER BY generation LIMIT 1", (username,)).fetchone()
+        state, code = ("failed", blocking["code"]) if blocking else ("queued", None)
+        connection.execute("INSERT INTO gateway_accounts(username,generation,applied_generation,state,code,updated_at) VALUES (?,?,NULL,?,?,?) ON CONFLICT(username) DO UPDATE SET generation=excluded.generation,state=excluded.state,code=excluded.code,updated_at=excluded.updated_at", (username, generation, state, code, now))
+        return operation_id
+
+    def pending_gateway_jobs(self) -> list[dict]:
+        with self.connect() as connection:
+            rows = connection.execute("""SELECT o.* FROM gateway_outbox o
+                WHERE o.state IN ('queued','pending') AND NOT EXISTS (
+                    SELECT 1 FROM gateway_outbox earlier WHERE earlier.username=o.username
+                    AND earlier.generation<o.generation AND earlier.state NOT IN ('applied','superseded')
+                ) ORDER BY o.created_at,o.operation_id""").fetchall()
+        jobs = []
+        for row in rows:
+            item = dict(row)
+            item["active"] = bool(item["active"])
+            item["networks"] = json.loads(item.pop("networks_json"))
+            item["credential_envelope"] = json.loads(item["credential_envelope"]) if item["credential_envelope"] else None
+            jobs.append(item)
+        return jobs
+
+    def retry_failed_gateway_jobs(self) -> int:
+        """显式重试最早未完成的失败投影，不改变操作、版本或密文。"""
+        with self.write_transaction() as connection:
+            rows = connection.execute("""SELECT o.operation_id,o.username,o.generation FROM gateway_outbox o
+                WHERE o.state='failed' AND NOT EXISTS (
+                    SELECT 1 FROM gateway_outbox earlier WHERE earlier.username=o.username
+                    AND earlier.generation<o.generation AND earlier.state NOT IN ('applied','superseded')
+                )""").fetchall()
+            now = utc_text()
+            for row in rows:
+                connection.execute("UPDATE gateway_outbox SET state='pending',code=NULL,updated_at=? WHERE operation_id=?", (now, row["operation_id"]))
+                # 若之后已有策略在等待本版本，账户状态仍代表最新版本；旧任务
+                # 的 applied 回执会将其推进回 queued，绝不覆盖更新版本。
+                connection.execute("UPDATE gateway_accounts SET state='pending',code=NULL,updated_at=? WHERE username=? AND generation=?", (now, row["username"], row["generation"]))
+                self.audit(connection, actor="gateway_sync_cli", source_ip="unix_socket", action="gateway_sync_retry", target=row["username"], outcome="success")
+        return len(rows)
+
+    def record_gateway_reply(self, operation_id: str, username: str, generation: int, state: str, code: str | None) -> None:
+        if state not in {"applied", "pending", "failed", "superseded"}:
+            raise ValueError("无效网关回执")
+        with self.write_transaction() as connection:
+            job = connection.execute("SELECT * FROM gateway_outbox WHERE operation_id=? AND username=? AND generation=?", (operation_id, username, generation)).fetchone()
+            if job is None:
+                return
+            if job["state"] == "superseded":
+                return
+            current = connection.execute("SELECT generation FROM gateway_accounts WHERE username=?", (username,)).fetchone()
+            now = utc_text()
+            if current is None or current["generation"] != generation:
+                clear = ",credential_envelope=NULL" if state in {"applied", "superseded"} else ""
+                connection.execute(f"UPDATE gateway_outbox SET state=?,code=?,updated_at=?{clear} WHERE operation_id=?", (state, code, now, operation_id))
+                if state == "applied":
+                    connection.execute("UPDATE gateway_accounts SET applied_generation=?,state='queued',code=NULL,updated_at=? WHERE username=?", (generation, now, username))
+                    self.audit(connection, actor="gateway_agent", source_ip="unix_socket", action="gateway_sync_applied", target=username, outcome="success")
+                elif state == "failed":
+                    connection.execute("UPDATE gateway_accounts SET state='failed',code=?,updated_at=? WHERE username=?", (code, now, username))
+                    self.audit(connection, actor="gateway_agent", source_ip="unix_socket", action="gateway_sync_failed", target=username, outcome="failure")
+                return
+            clear = ",credential_envelope=NULL" if state in {"applied", "superseded"} else ""
+            connection.execute(f"UPDATE gateway_outbox SET state=?,code=?,updated_at=?{clear} WHERE operation_id=?", (state, code, now, operation_id))
+            if state == "applied":
+                connection.execute("UPDATE gateway_accounts SET applied_generation=?,state=?,code=?,updated_at=? WHERE username=?", (generation, state, code, now, username))
+                self.audit(connection, actor="gateway_agent", source_ip="unix_socket", action="gateway_sync_applied", target=username, outcome="success")
+            else:
+                connection.execute("UPDATE gateway_accounts SET state=?,code=?,updated_at=? WHERE username=?", (state, code, now, username))
+                if state == "failed":
+                    self.audit(connection, actor="gateway_agent", source_ip="unix_socket", action="gateway_sync_failed", target=username, outcome="failure")
+
+    def gateway_status(self, username: str) -> dict:
+        with self.connect() as connection:
+            row = connection.execute("SELECT username,generation,applied_generation,state,code,updated_at FROM gateway_accounts WHERE username=?", (username,)).fetchone()
+        return dict(row) if row else {"username": username, "generation": 0, "applied_generation": None, "state": "not_provisioned", "code": None, "updated_at": None}
+
+    def list_gateway_statuses(self) -> list[dict]:
+        with self.connect() as connection:
+            users = [row[0] for row in connection.execute("SELECT username FROM users ORDER BY username")]
+        return [self.gateway_status(username) for username in users]
 
     def list_audit(self, cursor: int | None, limit: int) -> tuple[list[dict], int | None]:
         with self.connect() as connection:

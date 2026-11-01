@@ -11,9 +11,11 @@ license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
   "argon2-cffi>=23.1,<26",
+  "cryptography>=46,<51",
   "fastapi>=0.115,<1",
   "pydantic>=2.7,<3",
   "uvicorn[standard]>=0.30,<1",
+  "vici==6.0.3",
 ]
 
 [project.optional-dependencies]

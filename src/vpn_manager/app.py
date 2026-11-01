@@ -13,7 +13,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.staticfiles import StaticFiles
 
-from .models import AuditPage, DeviceCreate, DeviceView, ErrorResponse, LoginRequest, LoginResponse, MeResponse, MessageResponse, UserCreate, UserUpdate, UserView
+from .gateway_sync import GatewayClient, GatewayUnavailable, seal_credential
+from .models import AuditPage, DeviceCreate, DeviceView, ErrorResponse, GatewayStatus, LoginRequest, LoginResponse, MeResponse, MessageResponse, UserCreate, UserUpdate, UserView
 from .security import COOKIE_NAME, SESSION_TTL, hash_password, needs_rehash, new_secret, token_hash, utc_now, utc_text, verify_password
 from .store import DeviceConflict, DeviceQuotaExceeded, Store
 
@@ -94,7 +95,7 @@ class RequestBoundaryMiddleware:
         await self.app(scope,replay,secured_send)
 
 
-def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_origin: str = ALLOWED_ORIGIN, web_directory: str | Path | None = None) -> FastAPI:
+def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_origin: str = ALLOWED_ORIGIN, web_directory: str | Path | None = None, gateway_public_key: bytes | None = None, gateway_client: GatewayClient | None = None) -> FastAPI:
     origin = urlsplit(allowed_origin)
     if origin.scheme!="https" or not origin.hostname or origin.username or origin.password or origin.path or origin.query or origin.fragment:
         raise ValueError("管理入口必须是无路径的 HTTPS 来源")
@@ -103,6 +104,7 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
     store.initialize()
     app = FastAPI(title="VPN 管理器",docs_url=None,redoc_url=None,openapi_url=None)
     app.state.store, app.state.allowed_origin = store, allowed_origin
+    app.state.gateway_public_key, app.state.gateway_client = gateway_public_key, gateway_client
     app.add_middleware(CORSMiddleware,allow_origins=[allowed_origin],allow_credentials=True,allow_methods=["GET","POST","PATCH","OPTIONS"],allow_headers=["Content-Type","X-CSRF-Token"],max_age=600)
     app.add_middleware(RequestBoundaryMiddleware)
     password_slots = BoundedSemaphore(2)
@@ -119,6 +121,18 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
     @app.exception_handler(sqlite3.Error)
     async def database_unavailable(_,__):
         return JSONResponse({"error":{"code":"service_unavailable","message":"服务暂不可用，请稍后重试。"}},status_code=503)
+
+    def queue_gateway_change(connection: Any, username: str, active: bool, networks: list[str], password: str | None) -> None:
+        """仅已投影账户或显式重设密码可入队，避免为历史账户伪造 VPN 状态。"""
+        if gateway_public_key is None:
+            return
+        projected = connection.execute("SELECT 1 FROM gateway_accounts WHERE username=?", (username,)).fetchone() is not None
+        if not projected and password is None:
+            return
+        generation = store.next_gateway_generation(connection, username)
+        envelope = seal_credential(gateway_public_key, username, generation, password) if password is not None else None
+        store.queue_gateway_change(connection, username, generation, active, networks, envelope)
+        store.audit(connection, actor=None, source_ip=None, action="gateway_sync_queued", target=username, outcome="success")
 
     def current_user(session_token: Annotated[str | None,Cookie(alias=COOKIE_NAME)] = None):
         user = store.session_user(session_token) if session_token else None
@@ -245,7 +259,8 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
 
     @app.post("/api/admin/users", response_model=UserView, status_code=201, responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}, 409: {"model": ErrorResponse}})
     def create_user(payload: UserCreate, request: Request, actor: Annotated[dict[str, Any], Depends(admin_mutation_user)]) -> dict[str, Any]:
-        password_hash = hash_password(payload.password.get_secret_value())
+        password = payload.password.get_secret_value()
+        password_hash = hash_password(password)
         with store.write_transaction() as connection:
             actor = authorize_write(connection, request, admin=True)
             now = utc_text()
@@ -254,6 +269,7 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
             except sqlite3.IntegrityError:
                 raise ApiError(409, "username_conflict", "此账户名已存在。")
             connection.executemany("INSERT INTO user_networks(username, network) VALUES (?, ?)", [(payload.username, network) for network in payload.networks])
+            queue_gateway_change(connection, payload.username, True, payload.networks, password)
             created = store.user_from_row(connection, connection.execute("SELECT * FROM users WHERE username = ?", (payload.username,)).fetchone())
             store.audit(connection, actor=actor["username"], source_ip=source_ip(request), action="user_create", target=payload.username, outcome="success")
         return public_user(created)
@@ -266,7 +282,8 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
 
     @app.patch("/api/admin/users/{username}", response_model=UserView, responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}})
     def update_user(username: str, payload: UserUpdate, request: Request, actor: Annotated[dict[str, Any], Depends(admin_mutation_user)]) -> dict[str, Any]:
-        replacement = hash_password(payload.password.get_secret_value()) if payload.password is not None else None
+        password = payload.password.get_secret_value() if payload.password is not None else None
+        replacement = hash_password(password) if password is not None else None
         with store.write_transaction() as connection:
             actor = authorize_write(connection, request, admin=True)
             current = store.user_from_row(connection, connection.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone())
@@ -275,16 +292,31 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
             next_role = payload.role if payload.role is not None else current["role"]
             next_active = payload.active if payload.active is not None else current["active"]
             protect_last_admin(connection, current, next_role, next_active)
-            changed = next_role != current["role"] or next_active != current["active"]
+            # 降为普通用户即使没有显式 networks 也必须收敛为唯一的 work
+            # 权限；不让旧管理员的 home 授权滞留在账户或网关投影中。
             next_networks = payload.networks if payload.networks is not None else current["networks"]
-            changed = changed or next_networks != current["networks"] or payload.password is not None
+            if next_role == "user":
+                if payload.networks is None and current["role"] != "user":
+                    next_networks = ["work"]
+                if next_networks != ["work"]:
+                    raise ApiError(422, "invalid_network_policy", "普通用户只能拥有 work 网络权限。")
+            role_changed = next_role != current["role"]
+            vpn_changed = (
+                next_active != current["active"]
+                or next_networks != current["networks"]
+                or payload.password is not None
+                or role_changed
+            )
+            changed = role_changed or vpn_changed
             if changed:
                 password_hash = replacement if replacement is not None else current["password_hash"]
                 connection.execute("UPDATE users SET password_hash = ?, role = ?, active = ?, updated_at = ? WHERE username = ?", (password_hash, next_role, int(next_active), utc_text(), username))
-                if payload.networks is not None:
+                if next_networks != current["networks"]:
                     connection.execute("DELETE FROM user_networks WHERE username = ?", (username,))
                     connection.executemany("INSERT INTO user_networks(username, network) VALUES (?, ?)", [(username, network) for network in next_networks])
                 store.revoke_sessions(connection, username)
+                if vpn_changed:
+                    queue_gateway_change(connection, username, next_active, next_networks, password)
             store.audit(connection, actor=actor["username"], source_ip=source_ip(request), action="user_update", target=username, outcome="success")
             updated = store.user_from_row(connection, connection.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone())
         return public_user(updated)
@@ -300,6 +332,7 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
             if current["active"]:
                 connection.execute("UPDATE users SET active = 0, updated_at = ? WHERE username = ?", (utc_text(), username))
                 store.revoke_sessions(connection, username)
+                queue_gateway_change(connection, username, False, [], None)
             store.audit(connection, actor=actor["username"], source_ip=source_ip(request), action="user_deactivate", target=username, outcome="success")
             updated = store.user_from_row(connection, connection.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone())
         return public_user(updated)
@@ -334,6 +367,21 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
     def audit_log(_: Annotated[dict,Depends(admin_user)],cursor: int | None = Query(default=None,ge=1),limit: int = Query(default=50,ge=1,le=100)):
         items,next_cursor=store.list_audit(cursor,limit)
         return {"items":items,"next_cursor":next_cursor}
+
+    @app.get("/api/admin/gateway-status", response_model=list[GatewayStatus])
+    def all_gateway_status(_: Annotated[dict, Depends(admin_user)]):
+        return store.list_gateway_statuses()
+
+    @app.get("/api/vpn/status", response_model=GatewayStatus)
+    def gateway_status(user: Annotated[dict, Depends(current_user)]):
+        if gateway_client is None:
+            raise ApiError(503, "gateway_unavailable", "管理服务尚未接入现有 VPN 网关。")
+        try:
+            reply = gateway_client.status(user["username"])
+        except GatewayUnavailable:
+            raise ApiError(503, "gateway_unavailable", "VPN 网关暂不可用。")
+        state = reply["state"]
+        return {"username": user["username"], "generation": reply["generation"], "applied_generation": reply["generation"] if state == "applied" and reply["generation"] else None, "state": state, "code": reply.get("code"), "updated_at": None}
 
     @app.api_route("/api/vpn/{operation:path}",methods=["GET","POST","PATCH","PUT","DELETE"])
     def unavailable_gateway(_: Annotated[dict,Depends(current_user)]):

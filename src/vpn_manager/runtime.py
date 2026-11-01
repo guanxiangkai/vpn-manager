@@ -8,8 +8,40 @@ from pathlib import Path
 import stat
 
 import uvicorn
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
 
 from .app import create_app
+from .gateway_sync import GatewayClient
+
+
+def _load_gateway_public_key(value: str) -> bytes:
+    """只接受受控的常规 PEM 文件，拒绝链接、目录及可被旁人改写的配置。"""
+    path = Path(value)
+    try:
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode) or before.st_mode & 0o022:
+            raise RuntimeError("网关公钥文件不安全")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            after = os.fstat(descriptor)
+            if not stat.S_ISREG(after.st_mode) or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                raise RuntimeError("网关公钥文件不安全")
+            data = os.read(descriptor, 16 * 1024 + 1)
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise RuntimeError("无法安全读取网关公钥") from error
+    if not data or len(data) > 16 * 1024:
+        raise RuntimeError("网关公钥文件无效")
+    try:
+        key = serialization.load_pem_public_key(data)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("网关公钥文件无效") from error
+    if not isinstance(key, X25519PublicKey):
+        raise RuntimeError("网关公钥必须为 X25519")
+    return data
 
 
 def application():
@@ -19,7 +51,14 @@ def application():
     database = Path(os.environ["VPN_MANAGER_DB"])
     if not database.is_file():
         raise RuntimeError("必须先完成账户初始化")
-    return create_app(database, allowed_origin=os.environ["VPN_MANAGER_ORIGIN"], web_directory=os.environ["VPN_MANAGER_WEB_DIRECTORY"])
+    public_key_path, socket_path = os.environ.get("VPN_MANAGER_GATEWAY_PUBLIC_KEY"), os.environ.get("VPN_MANAGER_GATEWAY_SOCKET")
+    if bool(public_key_path) != bool(socket_path):
+        raise RuntimeError("网关公钥与 Unix socket 必须同时配置")
+    gateway_public_key = _load_gateway_public_key(public_key_path) if public_key_path else None
+    if socket_path and not Path(socket_path).is_absolute():
+        raise RuntimeError("网关 Unix socket 必须使用绝对路径")
+    gateway_client = GatewayClient(socket_path) if socket_path else None
+    return create_app(database, allowed_origin=os.environ["VPN_MANAGER_ORIGIN"], web_directory=os.environ["VPN_MANAGER_WEB_DIRECTORY"], gateway_public_key=gateway_public_key, gateway_client=gateway_client)
 
 
 def main() -> None:

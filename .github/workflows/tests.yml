@@ -29,8 +29,8 @@ jobs:
           python -m playwright install --with-deps chromium
       - name: 检查依赖一致性
         run: python -m pip check
-      - name: 运行接口回归测试
-        run: timeout 240 python -m pytest tests/test_api.py -v -p no:cacheprovider
+      - name: 运行接口与网关回归测试
+        run: timeout 240 python -m pytest tests/test_api.py tests/test_gateway_sync.py tests/test_gateway_agent.py -v -p no:cacheprovider
       - name: 运行原生 HTTPS Chromium 验收
         run: timeout 240 bash tests/run_browser_acceptance.sh
         env:

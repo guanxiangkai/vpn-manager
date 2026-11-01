@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Event
 
@@ -85,7 +86,7 @@ def test_role_and_cross_account_device_boundaries(database):
     assert member.get('/api/auth/me').status_code==200
 
 
-@pytest.mark.parametrize('change',[{'password':'a-brand-new-password'},{'networks':['home']},{'active':False}])
+@pytest.mark.parametrize('change',[{'password':'a-brand-new-password'},{'role':'admin','networks':['home']},{'active':False}])
 def test_account_change_revokes_all_sessions_and_reenable_does_not_restore(database,change):
     admin,member=client_for(database),client_for(database)
     a=login(admin)
@@ -96,6 +97,74 @@ def test_account_change_revokes_all_sessions_and_reenable_does_not_restore(datab
         assert admin.patch('/api/admin/users/member',headers=csrf(a),json={'active':True}).status_code==200
         assert member.get('/api/auth/me').status_code==401
     assert admin.get('/api/auth/me').status_code==200
+
+
+def test_gateway_projection_is_queued_atomically_and_never_reported_as_applied(database):
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    key = X25519PrivateKey.generate()
+    public = key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+    admin, member = TestClient(create_app(database, gateway_public_key=public), base_url=ALLOWED_ORIGIN), client_for(database)
+    token = login(admin)
+    assert login(member, 'member', 'correct-horse-member')
+    assert admin.patch('/api/admin/users/member', headers=csrf(token), json={'password':'a-brand-new-password','networks':['work']}).status_code == 200
+    assert member.get('/api/auth/me').status_code == 401
+    store = Store(database)
+    job = store.pending_gateway_jobs()[0]
+    assert job['username'] == 'member' and job['generation'] == 1 and job['state'] == 'queued'
+    assert 'a-brand-new-password' not in json.dumps(job)
+    status = admin.get('/api/admin/gateway-status').json()
+    assert next(item for item in status if item['username'] == 'member')['state'] == 'queued'
+    store.record_gateway_reply(job['operation_id'], 'member', 1, 'failed', 'gateway_rejected')
+    status = admin.get('/api/admin/gateway-status').json()
+    assert next(item for item in status if item['username'] == 'member')['state'] == 'failed'
+
+
+def test_user_role_is_work_only_across_create_update_bootstrap_and_downgrade(tmp_path):
+    database = tmp_path / 'manager.sqlite3'
+    bootstrap(str(database), [
+        {'username': 'adminone', 'password': 'correct-horse-admin-one', 'role': 'admin', 'networks': ['home', 'work']},
+        {'username': 'admintwo', 'password': 'correct-horse-admin-two', 'role': 'admin', 'networks': ['home']},
+        {'username': 'member', 'password': 'correct-horse-member', 'role': 'user', 'networks': ['work']},
+    ])
+    client = client_for(database)
+    token = login(client)
+    rejected = client.post('/api/admin/users', headers=csrf(token), json={
+        'username': 'badmember', 'password': 'correct-horse-bad-member', 'role': 'user', 'networks': ['home'],
+    })
+    assert rejected.status_code == 422
+    assert Store(database).find_user('badmember') is None
+    assert client.patch('/api/admin/users/member', headers=csrf(token), json={'networks': ['home']}).status_code == 422
+    assert client.get('/api/auth/me').status_code == 200
+    downgraded = client.patch('/api/admin/users/adminone', headers=csrf(token), json={'role': 'user'})
+    assert downgraded.status_code == 200
+    assert downgraded.json()['role'] == 'user'
+    assert downgraded.json()['networks'] == ['work']
+    assert client.get('/api/auth/me').status_code == 401
+    with pytest.raises(ValueError, match='无效账户记录'):
+        bootstrap(str(tmp_path / 'invalid.sqlite3'), [
+            {'username': 'badmember', 'password': 'correct-horse-bad-member', 'role': 'user', 'networks': ['home']},
+        ])
+
+
+def test_role_downgrade_revokes_sessions_and_queues_gateway_policy(tmp_path):
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+
+    database = tmp_path / 'manager.sqlite3'
+    key = X25519PrivateKey.generate()
+    public = key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+    bootstrap(str(database), [
+        {'username': 'adminone', 'password': 'correct-horse-admin-one', 'role': 'admin', 'networks': ['home', 'work']},
+        {'username': 'admintwo', 'password': 'correct-horse-admin-two', 'role': 'admin', 'networks': ['work']},
+    ], public)
+    client = TestClient(create_app(database, gateway_public_key=public), base_url=ALLOWED_ORIGIN)
+    token = login(client)
+    response = client.patch('/api/admin/users/adminone', headers=csrf(token), json={'role': 'user'})
+    assert response.status_code == 200 and response.json()['networks'] == ['work']
+    assert client.get('/api/auth/me').status_code == 401
+    status = Store(database).gateway_status('adminone')
+    assert status['generation'] == 2 and status['state'] == 'queued'
 
 
 def test_last_admin_cannot_be_removed_and_errors_do_not_echo_password(database):
@@ -263,7 +332,7 @@ def test_migration_retains_accounts_history_and_rejects_old_sessions(tmp_path,ve
     Store(path).initialize()
     assert client.get('/api/auth/me').status_code==200
     with Store(path).connect() as c:
-        assert c.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0]=='4'
+        assert c.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0]=='6'
         assert c.execute('SELECT revoked_at FROM sessions WHERE token_hash=?',(token_hash('old-cookie'),)).fetchone()[0]
         assert c.execute("SELECT COUNT(*) FROM audit_events WHERE action='authentication_schema_upgrade'").fetchone()[0]==1
         assert c.execute("SELECT COUNT(*) FROM audit_events WHERE action='historical_login'").fetchone()[0] == 1
@@ -272,6 +341,39 @@ def test_migration_retains_accounts_history_and_rejects_old_sessions(tmp_path,ve
         assert records == {'old-active':'registered','old-revoked':'removed'}
         if version == 3:
             assert tuple(c.execute('SELECT * FROM device_certificates').fetchone()) == ('old-certificate','web','active')
+
+
+def test_schema_v4_migrates_to_gateway_v6_without_projecting_existing_accounts(tmp_path):
+    path = tmp_path / 'v4.sqlite3'
+    create_legacy_database(path, 3)
+    Store(path).initialize()
+    with sqlite3.connect(path) as connection:
+        connection.execute('DROP INDEX gateway_outbox_pending_idx')
+        connection.execute('DROP TABLE gateway_outbox')
+        connection.execute('DROP TABLE gateway_accounts')
+        connection.execute("UPDATE schema_metadata SET value='4' WHERE key='schema_version'")
+    Store(path).initialize()
+    assert Store(path).gateway_status('legacy')['state'] == 'not_provisioned'
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == '6'
+        assert connection.execute("SELECT COUNT(*) FROM audit_events WHERE action='gateway_schema_upgrade'").fetchone()[0] == 1
+
+
+def test_schema_v5_migration_normalizes_legacy_user_networks(tmp_path):
+    path = tmp_path / 'v5.sqlite3'
+    bootstrap(str(path), [{'username': 'member', 'password': 'correct-horse-member', 'role': 'user', 'networks': ['work']}])
+    client = client_for(path)
+    login(client, 'member', 'correct-horse-member')
+    with Store(path).write_transaction() as connection:
+        connection.execute("DELETE FROM user_networks WHERE username='member'")
+        connection.execute("INSERT INTO user_networks(username,network) VALUES ('member','home')")
+        connection.execute("UPDATE schema_metadata SET value='5' WHERE key='schema_version'")
+    Store(path).initialize()
+    assert Store(path).find_user('member')['networks'] == ['work']
+    assert client.get('/api/auth/me').status_code == 401
+    with Store(path).connect() as connection:
+        assert connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == '6'
+        assert connection.execute("SELECT COUNT(*) FROM audit_events WHERE action='user_network_policy_upgrade'").fetchone()[0] == 1
 
 
 def test_migration_failure_rolls_back_schema_and_old_session_revocation(tmp_path, monkeypatch):

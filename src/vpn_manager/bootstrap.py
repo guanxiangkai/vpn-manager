@@ -5,6 +5,7 @@ import argparse
 import json
 import sqlite3
 import sys
+from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
@@ -12,9 +13,10 @@ from pydantic import ValidationError
 from .models import UserCreate
 from .security import hash_password, utc_text
 from .store import Store
+from .gateway_sync import seal_credential
 
 
-def bootstrap(database_path: str, payload: Any) -> int:
+def bootstrap(database_path: str, payload: Any, gateway_public_key: bytes | None = None) -> int:
     records = payload.get("users") if isinstance(payload, dict) else payload
     if not isinstance(records, list) or not records:
         raise ValueError("标准输入 JSON 必须是非空账户数组，或包含 users 数组的对象")
@@ -41,6 +43,10 @@ def bootstrap(database_path: str, payload: Any) -> int:
                     "INSERT INTO user_networks(username, network) VALUES (?, ?)",
                     [(user.username, network) for network in user.networks],
                 )
+                if gateway_public_key is not None:
+                    generation = store.next_gateway_generation(connection, user.username)
+                    envelope = seal_credential(gateway_public_key, user.username, generation, user.password.get_secret_value())
+                    store.queue_gateway_change(connection, user.username, generation, True, user.networks, envelope)
         except sqlite3.IntegrityError as error:
             raise ValueError("账户初始化无法创建账户记录") from error
     return len(users)
@@ -49,10 +55,12 @@ def bootstrap(database_path: str, payload: Any) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="通过标准输入 JSON 初始化测试环境的 VPN 账户。")
     parser.add_argument("--database", required=True, help="SQLite 数据库路径（不含秘密）")
+    parser.add_argument("--gateway-public-key", help="可选的本机网关 X25519 PEM 公钥路径")
     arguments = parser.parse_args()
     try:
         payload = json.load(sys.stdin)
-        count = bootstrap(arguments.database, payload)
+        gateway_public_key = Path(arguments.gateway_public_key).read_bytes() if arguments.gateway_public_key else None
+        count = bootstrap(arguments.database, payload, gateway_public_key)
     except (ValueError, json.JSONDecodeError) as error:
         print(f"账户初始化失败：{error}", file=sys.stderr)
         return 2

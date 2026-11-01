@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 Network = Literal["home", "work"]
 Role = Literal["admin", "user"]
@@ -31,6 +31,12 @@ class UserCreate(StrictModel):
             raise ValueError("网络权限不能重复")
         return value
 
+    @model_validator(mode="after")
+    def user_role_is_work_only(self) -> "UserCreate":
+        if self.role == "user" and self.networks != ["work"]:
+            raise ValueError("普通用户只能拥有 work 网络权限")
+        return self
+
 
 class UserUpdate(StrictModel):
     password: SecretStr | None = Field(default=None, min_length=10, max_length=256)
@@ -44,6 +50,14 @@ class UserUpdate(StrictModel):
         if value is not None and len(value) != len(set(value)):
             raise ValueError("网络权限不能重复")
         return value
+
+    @model_validator(mode="after")
+    def explicit_user_role_is_work_only(self) -> "UserUpdate":
+        # 未携带 role 时需由服务层按账户当前角色判断；这里先拒绝请求自身
+        # 已明确把最终角色设为 user 的越权组合。
+        if self.role == "user" and self.networks is not None and self.networks != ["work"]:
+            raise ValueError("普通用户只能拥有 work 网络权限")
+        return self
 
 
 class UserView(StrictModel):
@@ -76,6 +90,17 @@ class DeviceView(StrictModel):
     state: Literal["registered", "removed"]
     created_at: datetime
     updated_at: datetime
+
+
+class GatewayStatus(StrictModel):
+    """管理端持久化的网关投影状态；queued 不表示 IKE 已生效。"""
+
+    username: str
+    generation: int = Field(ge=0)
+    applied_generation: int | None = Field(default=None, ge=1)
+    state: Literal["not_provisioned", "queued", "pending", "applied", "failed", "superseded"]
+    code: str | None = None
+    updated_at: datetime | None = None
 
 
 class MessageResponse(StrictModel):
