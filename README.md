@@ -45,7 +45,7 @@ vault_command_that_emits_json | python -m vpn_manager.bootstrap --database /var/
 - `VPN_MANAGER_DB`：已完成账户初始化的 SQLite 数据库路径。
 - `VPN_MANAGER_WEB_DIRECTORY`：静态网页目录（通常为仓库的 `web/`）。
 - `VPN_MANAGER_ORIGIN`：唯一允许的 HTTPS 浏览器 Origin，例如 `https://manager.example.internal`。
-- `VPN_MANAGER_GATEWAY_PUBLIC_KEY` 和 `VPN_MANAGER_GATEWAY_SOCKET`：可选但必须成对配置，分别为受控 X25519 公钥文件与绝对 Unix socket 路径。Web 进程不直接运行网关投递；需另启 `python -m vpn_manager.gateway_sync --database PATH --socket PATH`。
+- `VPN_MANAGER_GATEWAY_PUBLIC_KEY` 和 `VPN_MANAGER_GATEWAY_SOCKET`：可选但必须成对配置，分别为受控 X25519 公钥文件与绝对 Unix socket 路径。Web 进程不直接运行网关投递；需另启 `python -m vpn_manager.gateway_sync --database PATH --socket PATH --watch`，由 systemd 管理唯一实例。持续模式默认每 5 秒处理待同步任务，也可用 `--once` 执行一次。
 
 将 `INTERNAL_IP` 替换为服务器的内部监听地址，并确保私钥文件只对运行服务的账户可读：
 
@@ -76,6 +76,8 @@ python -m vpn_manager.runtime --bind INTERNAL_IP --port 8443 \
 ## 网关权限与恢复
 
 账户创建、密码、角色、网络权限及启用状态变更，会与递增 generation 和 outbox 在同一 SQLite 事务内提交。密码用 X25519/HKDF/AES-GCM 封装，仅 root 网关可解密；成功回执后清除 outbox 密文。`pending` 保留原任务重试，显式失败可用同步命令的 `--retry-failed` 重试。不得把待下发状态显示成已生效。
+
+持续同步使用 `--watch`，不自动重放明确失败的任务。排查失败原因后，先停止持续服务，再用 `--once --retry-failed` 执行受控重试，核对具体 generation 后恢复服务；不要同时启动多个消费者。
 
 `vpn_manager.gateway_agent` 只连接专用 charon VICI socket，不操作旧证书连接。网关按已验证的 EAP 身份选择精确账户，每用户独立地址池及 reqid。权限减少先在既有过滤链前部隔离旧流量，再卸载认证、终止全部该账户 SA、装载并读回新策略，最后解除隔离；任何一步失败均保持 `pending` 并尝试维持隔离。普通用户的家庭访问同时受流量选择器和防火墙约束。
 

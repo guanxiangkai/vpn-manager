@@ -14,6 +14,31 @@ from vpn_manager import gateway_sync, runtime
 from vpn_manager.store import Store
 
 
+def test_watch_retries_pending_without_replaying_failed_jobs(monkeypatch):
+    calls = []
+    monkeypatch.setattr(gateway_sync.sys, "argv", ["sync", "--database", "db", "--socket", "/run/agent", "--watch"])
+    monkeypatch.setattr(gateway_sync, "run_once", lambda *args, **kwargs: calls.append((args, kwargs)) or 1)
+
+    def sleep(interval):
+        assert interval == 5
+        if len(calls) == 2:
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(gateway_sync.time, "sleep", sleep)
+    with pytest.raises(KeyboardInterrupt):
+        gateway_sync.main()
+    assert calls == [(("db", "/run/agent"), {}), (("db", "/run/agent"), {})]
+
+
+@pytest.mark.parametrize("extra", [["--retry-failed"], ["--interval", "0"], ["--interval", "301"]])
+def test_watch_rejects_unsafe_retry_or_unbounded_frequency(monkeypatch, extra):
+    monkeypatch.setattr(gateway_sync.sys, "argv", ["sync", "--database", "db", "--socket", "/run/agent", "--watch", *extra])
+    monkeypatch.setattr(gateway_sync, "run_once", lambda *args, **kwargs: pytest.fail("不应开始同步"))
+    with pytest.raises(SystemExit) as error:
+        gateway_sync.main()
+    assert error.value.code == 2
+
+
 def key_pair():
     private = X25519PrivateKey.generate()
     return (

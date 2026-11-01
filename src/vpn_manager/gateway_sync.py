@@ -8,6 +8,7 @@ import json
 import os
 import re
 import socket
+import time
 import sys
 import uuid
 from pathlib import Path
@@ -219,12 +220,25 @@ def run_once(database_path: str, socket_path: str, *, retry_failed: bool = False
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="处理一次本机 VPN 网关同步队列。")
+    parser = argparse.ArgumentParser(description="处理本机 VPN 网关同步队列。")
     parser.add_argument("--database", required=True)
     parser.add_argument("--socket", required=True)
-    parser.add_argument("--once", action="store_true", required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--once", action="store_true")
+    mode.add_argument("--watch", action="store_true", help="持续处理待同步任务；明确失败仍需人工重试。")
+    parser.add_argument("--interval", type=int, default=5, help="持续模式的检查间隔，5–300 秒。")
     parser.add_argument("--retry-failed", action="store_true", help="重试最早未完成的明确失败投影；复用原 operation_id 与密文。")
     arguments = parser.parse_args()
+    if not 5 <= arguments.interval <= 300:
+        parser.error("检查间隔必须在 5–300 秒之间")
+    if arguments.watch:
+        # 由 systemd 持有唯一服务实例；断连的 pending 任务稍后重试，
+        # failed 任务不能在无人确认时反复重放，也不记录任务的认证材料。
+        if arguments.retry_failed:
+            parser.error("持续模式不能自动重试明确失败的任务")
+        while True:
+            run_once(arguments.database, arguments.socket)
+            time.sleep(arguments.interval)
     return run_once(arguments.database, arguments.socket, retry_failed=arguments.retry_failed)
 
 
