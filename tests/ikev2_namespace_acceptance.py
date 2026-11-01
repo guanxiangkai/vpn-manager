@@ -123,6 +123,20 @@ class Acceptance:
         self.check('assigned_vip_'+username,len(addresses)==1)
         self.vip=addresses[0].decode()
         self.check('vip_verified_eap_'+username,ipaddress.ip_address(self.vip) in ipaddress.ip_network(self.agent.state['accounts'][username]['pool']))
+        # 读回服务端已认证身份和实际安装的 SA，不能只凭客户端握手成功判断权限。
+        with self.session('gateway') as s:
+            server_sas=list(s.list_sas({'ike':'account-'+username}))
+        matched=[value for item in server_sas for value in item.values()
+                 if value.get('state')==b'ESTABLISHED'
+                 # strongSwan 仅在 EAP ID 与 IKE ID 不同时单独返回 remote-eap-id。
+                 and value.get('remote-eap-id',value.get('remote-id'))==username.encode()
+                 and self.vip.encode() in value.get('remote-vips',[])]
+        self.check('server_verified_eap_'+username,len(matched)==1)
+        child_sas=list(matched[0].get('child-sas',{}).values())
+        reqid=str(self.agent.state['accounts'][username]['reqid']).encode()
+        self.check('installed_account_reqid_'+username,
+                   bool(child_sas) and all(child.get('state')==b'INSTALLED'
+                                          and child.get('reqid')==reqid for child in child_sas))
     def ping(self,target,expected,label):
         p=self.run(['ping','-n','-I',self.vip,'-c','1','-W','1',target],'client',success=False,timeout=4)
         self.check(label,(p.returncode==0)==expected)
