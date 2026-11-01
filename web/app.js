@@ -41,6 +41,7 @@ async function loadConfig() {
     if (config.apiBaseUrl) {
       const configuredUrl = new URL(config.apiBaseUrl, window.location.href);
       if (configuredUrl.protocol !== "https:") throw new Error("服务地址必须使用 HTTPS");
+      if (configuredUrl.origin !== window.location.origin || configuredUrl.username || configuredUrl.password) throw new Error("当前部署只支持同源 HTTPS API，配置中不得包含凭据");
       if (configuredUrl.pathname !== "/" || configuredUrl.search || configuredUrl.hash) throw new Error("apiBaseUrl 只能是 API 主机的根 HTTPS 地址");
       state.apiBaseUrl = configuredUrl.origin;
     }

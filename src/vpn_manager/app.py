@@ -89,7 +89,8 @@ class RequestBoundaryMiddleware:
             if not event.get("more_body",False):
                 break
         async def replay():
-            return events.pop(0) if events else {"type":"http.request","body":b"","more_body":False}
+            # 已缓冲请求读完后继续等待真实连接事件，不能不断伪造空请求。
+            return events.pop(0) if events else await receive()
         await self.app(scope,replay,secured_send)
 
 

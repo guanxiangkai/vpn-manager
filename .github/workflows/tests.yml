@@ -30,6 +30,6 @@ jobs:
       - name: 检查依赖一致性
         run: python -m pip check
       - name: 运行接口回归测试
-        run: python -m pytest tests/test_api.py -q -p no:cacheprovider
+        run: timeout 240 python -m pytest tests/test_api.py -v -p no:cacheprovider
       - name: 运行原生 HTTPS Chromium 验收
         run: bash tests/run_browser_acceptance.sh

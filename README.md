@@ -9,7 +9,7 @@
 - 账户使用 Argon2id 密码哈希；角色为 `admin` 或 `user`，网络权限只能是 `home`、`work`。
 - 管理会话为随机的 HttpOnly、Secure、SameSite=Lax Cookie；登录和 `POST /api/auth/refresh` 返回仅存于页面内存的 CSRF 令牌。
 - `GET /api/auth/me` 为无副作用的只读用户资料接口；刷新浏览器页面应调用 `POST /api/auth/refresh` 恢复会话并取得新的 CSRF 令牌。
-- 管理员可管理账户、设备登记记录和审计；普通用户只能读取自己的资料和设备记录。服务端执行角色与账户隔离。
+- 管理员可管理账户、设备登记记录和审计；普通用户仅可访问自己的资料和设备记录，不能读取或修改他人数据。服务端执行角色与账户隔离。
 - 修改账户密码、角色、启用状态或网络权限会立即撤销该账户的管理会话。
 - 设备名单只是管理记录。每账户最多 10 条 `registered` 记录，`removed` 记录不占名额；它不认证设备，也不会阻止取得账户密码的新设备登录或连接 VPN。
 - 审计记录登录成功/失败、退出和管理操作；不会写入密码、哈希、Cookie 或请求体。
@@ -56,7 +56,7 @@ python -m vpn_manager.runtime --bind INTERNAL_IP --port 8443 \
   --cert /protected/server.pem --key /protected/server.key
 ```
 
-不要使用 `--reload`，不要将监听地址改为未评估的公网地址，也不要把密钥、密码或 Cookie 写入日志。OpenAPI、Swagger 和 ReDoc 不应作为公开入口。生产网络暴露、TLS 证书轮换、备份恢复、审计留存和真实浏览器验收仍待实际部署环境验证。
+不要使用 `--reload`，不要将监听地址改为未评估的公网地址，也不要把密钥、密码或 Cookie 写入日志。ECS 的内部地址可能由 EIP 映射，必须在安全组或主机防火墙验证只允许预期的 VPN 来源；仅绑定内部 IP 不构成公网隔离。OpenAPI、Swagger 和 ReDoc 不应作为公开入口。生产网络暴露、TLS 证书轮换、备份恢复、审计留存和真实浏览器验收仍待实际部署环境验证。
 
 ## 浏览器认证与接口约定
 
