@@ -1,4 +1,4 @@
-from __future__ import annotations
+# 路由依赖定义在 create_app 内，注解需立即求值以保留局部 Depends 引用。
 
 import sqlite3
 from ipaddress import ip_address
