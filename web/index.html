@@ -50,8 +50,8 @@
           <div id="profile-content" hidden>
             <dl class="details-list"><div><dt>账户</dt><dd id="profile-username"></dd></div><div><dt>角色</dt><dd id="profile-role"></dd></div><div><dt>账户状态</dt><dd id="profile-status"></dd></div></dl>
             <h2>授权网络</h2><div id="network-list" class="network-list"></div>
-            <section class="guidance" aria-labelledby="guidance-title"><h2 id="guidance-title">连接说明</h2><ol><li>在 Windows 或 macOS 系统设置中添加管理员提供的 VPN 连接，并使用分配的账户和密码登录。</li><li>账户密码用于身份验证；请妥善保管，不要共享给他人。</li><li>在系统设置中发起连接并查看状态；本网页不能启动原生 VPN，也不以浏览器公网 IP 判断连接。家庭或工作 LAN 的路由由系统原生客户端和网关策略选择。</li></ol><p class="warning">设备名单仅用于管理记录，不验证设备身份，也不会阻止持有账户密码的新设备访问。它不表示 VPN 已连接或可用。</p></section>
-            <section class="device-summary" aria-labelledby="my-devices-title"><h2 id="my-devices-title">我的设备登记记录</h2><div id="own-devices-state" class="state-panel" aria-live="polite">正在读取设备记录…</div><div id="own-devices-content" hidden class="table-wrap"><table><thead><tr><th scope="col">设备标识</th><th scope="col">登记状态</th><th scope="col">更新时间</th></tr></thead><tbody id="own-devices-body"></tbody></table></div><p class="muted">这是管理员维护的设备名单，普通用户不能自行添加或移除；名单不构成登录或 VPN 设备准入控制。</p></section>
+            <section class="guidance" aria-labelledby="guidance-title"><h2 id="guidance-title">连接说明</h2><p class="warning">VPN 账户登录尚未上线，请继续使用现有 VPN。上方网络为账户的授权配置，尚未下发到 VPN 网关。</p><ol><li>管理端通过账户密码登录，请妥善保管，不要共享给他人。</li><li>未来启用原生 VPN 账号登录后，在 Windows 或 macOS 系统设置中连接并查看状态。</li><li>本网页不能启动原生 VPN，也不以浏览器公网 IP 判断连接；本地局域网直连和远端网络路由须分别验证。</li></ol><p class="warning">设备名单仅用于管理记录，不验证设备身份，也不会阻止持有账户密码的新设备访问。</p></section>
+            <section class="device-summary" aria-labelledby="my-devices-title"><h2 id="my-devices-title">我的设备登记记录</h2><div id="own-devices-state" class="state-panel" aria-live="polite">正在读取设备记录…</div><div id="own-devices-content" hidden class="table-wrap"><table><thead><tr><th scope="col">设备标识</th><th scope="col">登记状态</th><th scope="col">更新时间</th></tr></thead><tbody id="own-devices-body"></tbody></table></div><p class="muted">此处只显示本人记录，管理员可在设备管理中维护名单；名单不构成登录或 VPN 设备准入控制。</p></section>
           </div>
         </section>
 

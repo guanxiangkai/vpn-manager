@@ -55,6 +55,7 @@ def _login(page, env: dict[str, str], credentials: tuple[str, str]) -> None:
     username, password = credentials
     page.goto(env["url"], wait_until="domcontentloaded")
     expect(page.locator("#login-view")).to_be_visible(timeout=15_000)
+    expect(page.locator("#app-view")).to_be_hidden()
     expect(page.locator("#login-submit")).to_be_enabled(timeout=15_000)
     # 页面同时保留隐藏的账户编辑对话框，限定到实际登录表单。
     form = page.locator("#login-form")
@@ -62,6 +63,8 @@ def _login(page, env: dict[str, str], credentials: tuple[str, str]) -> None:
     form.get_by_label("密码", exact=True).fill(password)
     form.get_by_role("button", name="登录", exact=True).click()
     expect(page.locator("#app-view")).to_be_visible(timeout=15_000)
+    expect(page.locator("#login-view")).to_be_hidden()
+    expect(form.get_by_label("密码", exact=True)).to_have_value("")
     expect(page.locator("#signed-in-user")).to_contain_text(username, timeout=15_000)
 
 
@@ -85,6 +88,8 @@ def test_anonymous_api_request_is_rejected(context, live_env):
     )
     assert response["status"] == 401
     assert response["body"]["error"]["code"] == "authentication_required"
+    expect(page.locator("#login-view")).to_be_visible()
+    expect(page.locator("#app-view")).to_be_hidden()
     _capture(page, "anonymous-login")
 
 
@@ -95,6 +100,7 @@ def test_admin_login_refresh_pages_and_logout(context, live_env):
     # 重载会清空页面内存中的 CSRF；界面必须通过 POST refresh 恢复会话。
     page.reload(wait_until="domcontentloaded")
     expect(page.locator("#app-view")).to_be_visible(timeout=15_000)
+    expect(page.locator("#login-view")).to_be_hidden()
     expect(page.locator("#signed-in-user")).to_contain_text("adminone", timeout=15_000)
     _capture(page, "admin-overview")
 
@@ -115,8 +121,10 @@ def test_admin_login_refresh_pages_and_logout(context, live_env):
 
     page.get_by_role("button", name="退出登录", exact=True).click()
     expect(page.locator("#login-view")).to_be_visible(timeout=15_000)
+    expect(page.locator("#app-view")).to_be_hidden()
     page.reload(wait_until="domcontentloaded")
     expect(page.locator("#login-view")).to_be_visible(timeout=15_000)
+    expect(page.locator("#app-view")).to_be_hidden()
 
 
 def test_member_can_read_own_records_but_cannot_see_admin_management(context, live_env):

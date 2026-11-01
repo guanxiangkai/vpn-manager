@@ -107,9 +107,10 @@ function showLogin() {
   state.user = null; state.csrfToken = null;
   if (elements.userDialog.open) elements.userDialog.close();
   if (elements.deviceDialog.open) elements.deviceDialog.close();
+  elements.userForm.reset(); elements.deviceForm.reset();
   elements.appView.hidden = true; elements.loginView.hidden = false; elements.loginForm.reset(); clearError(elements.loginError); $("#username").focus();
 }
-function showApp(user) { renderProfile(user); elements.loginView.hidden = true; elements.appView.hidden = false; showPage("overview"); }
+function showApp(user) { elements.loginForm.reset(); renderProfile(user); elements.loginView.hidden = true; elements.appView.hidden = false; showPage("overview"); }
 
 function acceptCurrentSession(response) {
   if (!response || typeof response.csrf_token !== "string") throw new Error("服务返回的会话信息不完整。");
