@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vpn-manager"
+version = "0.1.0"
+description = "设备绑定、账户权限与审计日志的 VPN 管理服务（测试阶段）"
+requires-python = ">=3.11"
+dependencies = [
+  "argon2-cffi>=23.1,<26",
+  "fastapi>=0.115,<1",
+  "pydantic>=2.7,<3",
+  "uvicorn[standard]>=0.30,<1",
+]
+
+[project.optional-dependencies]
+test = [
+  "httpx>=0.27,<1",
+  "pytest>=8,<10",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.setuptools.packages.find]
+where = ["src"]

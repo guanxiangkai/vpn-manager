@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>VPN 管理器</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">跳到主要内容</a>
+    <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+
+    <main id="login-view" class="login-shell">
+      <section class="login-panel" aria-labelledby="login-title">
+        <p class="eyebrow">VPN 访问管理</p>
+        <h1 id="login-title">VPN 账户管理</h1>
+        <p class="muted">使用已获授权的账户登录以查看 VPN 账户与网络信息。</p>
+        <div id="service-state" class="service-state" aria-live="polite">正在检查服务配置…</div>
+        <form id="login-form" novalidate>
+          <div class="field">
+            <label for="username">账户名</label>
+            <input id="username" name="username" autocomplete="username" required minlength="1" maxlength="64" pattern="[a-z][a-z0-9_-]{0,63}">
+          </div>
+          <div class="field">
+            <label for="password">密码</label>
+            <input id="password" name="password" type="password" autocomplete="current-password" required minlength="1" maxlength="256">
+          </div>
+          <p id="login-error" class="form-error" role="alert" hidden></p>
+          <button id="login-submit" class="button primary" type="submit">登录</button>
+        </form>
+      </section>
+    </main>
+
+    <div id="app-view" class="app-shell" hidden>
+      <aside class="sidebar" aria-label="主导航">
+        <div class="brand"><span class="brand-mark" aria-hidden="true">V</span><span>VPN 管理器</span></div>
+        <nav>
+          <button class="nav-item active" type="button" data-page="overview">账户与网络</button>
+          <button class="nav-item admin-only" type="button" data-page="users" hidden>账户管理</button>
+          <button class="nav-item admin-only" type="button" data-page="devices" hidden>设备管理</button>
+          <button class="nav-item admin-only" type="button" data-page="audit" hidden>登录审计</button>
+        </nav>
+        <div class="sidebar-footer"><span id="signed-in-user" class="small-text"></span><button id="logout-button" class="button quiet" type="button">退出登录</button></div>
+      </aside>
+      <main id="main-content" class="content" tabindex="-1">
+        <section id="overview-page" class="page" aria-labelledby="overview-title">
+          <p class="eyebrow">账户与网络</p><h1 id="overview-title">已授权访问</h1>
+          <div id="profile-state" class="state-panel" aria-live="polite">正在读取账户信息…</div>
+          <div id="profile-content" hidden>
+            <dl class="details-list"><div><dt>账户</dt><dd id="profile-username"></dd></div><div><dt>角色</dt><dd id="profile-role"></dd></div><div><dt>账户状态</dt><dd id="profile-status"></dd></div></dl>
+            <h2>授权网络</h2><div id="network-list" class="network-list"></div>
+            <section class="guidance" aria-labelledby="guidance-title"><h2 id="guidance-title">连接说明</h2><ol><li>在 Windows 或 macOS 系统设置中添加 IKEv2 VPN 连接，使用已独立登记的设备证书进行 EAP-TLS 身份验证，并填写管理员提供的服务器地址及所需远程 ID。</li><li>账户和密码仅用于本管理页面，不能作为仅密码 VPN 登录方式。设备证书的签发与登记由管理员在受控流程中完成。</li><li>在系统设置中发起连接并查看状态；本网页不能启动原生 VPN，也不以浏览器公网 IP 判断连接。家庭或工作 LAN 的路由由系统原生客户端和网关策略选择。</li></ol><p class="warning">设备验证、网关权限生效和 VPN 连接是独立状态。本页不会将账户资料或待处理设备预留表示为 VPN 已可用。</p></section>
+            <section class="device-summary" aria-labelledby="my-devices-title"><h2 id="my-devices-title">我的已登记设备</h2><div id="own-devices-state" class="state-panel" aria-live="polite">正在读取设备状态…</div><div id="own-devices-content" hidden class="table-wrap"><table><thead><tr><th scope="col">设备标识</th><th scope="col">状态</th><th scope="col">管理访问</th><th scope="col">网关撤销</th><th scope="col">操作</th></tr></thead><tbody id="own-devices-body"></tbody></table></div><p class="muted">仅已验证且已登记的设备可访问管理服务。不能在此自助登记、激活或导入设备密钥。</p></section>
+          </div>
+        </section>
+
+        <section id="users-page" class="page" aria-labelledby="users-title" hidden>
+          <div class="page-heading"><div><p class="eyebrow">管理</p><h1 id="users-title">账户管理</h1></div><button id="open-create-user" class="button primary" type="button">新建账户</button></div>
+          <div id="users-state" class="state-panel" aria-live="polite">正在读取账户列表…</div>
+          <div id="users-content" hidden class="table-wrap"><table><thead><tr><th scope="col">账户</th><th scope="col">角色</th><th scope="col">授权网络</th><th scope="col">状态</th><th scope="col">操作</th></tr></thead><tbody id="users-body"></tbody></table></div>
+        </section>
+
+        <section id="audit-page" class="page" aria-labelledby="audit-title" hidden>
+          <p class="eyebrow">管理</p><h1 id="audit-title">登录审计</h1>
+          <div id="audit-state" class="state-panel" aria-live="polite">正在读取审计记录…</div>
+          <div id="audit-content" hidden class="table-wrap"><table><thead><tr><th scope="col">时间</th><th scope="col">账户</th><th scope="col">动作</th><th scope="col">结果</th><th scope="col">来源</th></tr></thead><tbody id="audit-body"></tbody></table><div class="pager"><button id="audit-prev" class="button secondary" type="button" disabled>上一页</button><span id="audit-page-label" aria-live="polite"></span><button id="audit-next" class="button secondary" type="button" disabled>下一页</button></div></div>
+        </section>
+        <section id="devices-page" class="page" aria-labelledby="devices-title" hidden>
+          <div class="page-heading"><div><p class="eyebrow">管理</p><h1 id="devices-title">设备管理</h1></div><button id="open-reserve-device" class="button primary" type="button">预留设备</button></div>
+          <div class="field compact-field"><label for="device-account-select">账户</label><select id="device-account-select" disabled><option>正在读取账户…</option></select></div>
+          <p id="device-limit" class="muted">待处理、已启用和撤销中的设备合计最多 10 台。</p>
+          <div id="devices-state" class="state-panel" aria-live="polite">请选择账户。</div>
+          <div id="devices-content" hidden class="table-wrap"><table><thead><tr><th scope="col">设备标识</th><th scope="col">状态</th><th scope="col">管理访问</th><th scope="col">网关撤销</th><th scope="col">更新时间</th><th scope="col">操作</th></tr></thead><tbody id="devices-body"></tbody></table></div>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="user-dialog" aria-labelledby="user-dialog-title"><form id="user-form" method="dialog" novalidate><div class="dialog-heading"><h2 id="user-dialog-title">新建账户</h2><button id="close-user-dialog" class="icon-button" type="button" aria-label="关闭">×</button></div><input id="editing-username" type="hidden"><div class="field"><label for="managed-username">账户名</label><input id="managed-username" required minlength="1" maxlength="64" pattern="[a-z][a-z0-9_-]{0,63}"></div><div class="field"><label for="managed-password">密码 <span id="password-hint" class="muted">（至少 10 位）</span></label><input id="managed-password" type="password" minlength="10" maxlength="256" autocomplete="new-password"></div><fieldset><legend>角色</legend><label class="inline"><input type="radio" name="managed-role" value="user" checked> 普通用户</label><label class="inline"><input type="radio" name="managed-role" value="admin"> 管理员</label></fieldset><fieldset><legend>授权网络</legend><label class="inline"><input id="network-home" type="checkbox" value="home"> 家庭</label><label class="inline"><input id="network-work" type="checkbox" value="work"> 工作</label></fieldset><p id="user-form-error" class="form-error" role="alert" hidden></p><div class="dialog-actions"><button id="cancel-user" class="button secondary" type="button">取消</button><button id="save-user" class="button primary" type="submit">保存</button></div></form></dialog>
+    <dialog id="device-dialog" aria-labelledby="device-dialog-title"><form id="device-form" method="dialog" novalidate><div class="dialog-heading"><h2 id="device-dialog-title">预留设备</h2><button id="close-device-dialog" class="icon-button" type="button" aria-label="关闭">×</button></div><p id="device-account-note" class="muted"></p><p class="warning">仅录入已由受控流程签发的标识。不要在此上传或粘贴设备证书、私钥或密码。预留不会激活设备或签发 VPN 凭据。</p><div class="field"><label for="reserved-device-id">设备标识</label><input id="reserved-device-id" required minlength="1" maxlength="128" pattern="[A-Za-z0-9._:-]+"></div><div class="field"><label for="reserved-vpn-certificate-id">VPN 证书标识</label><input id="reserved-vpn-certificate-id" required minlength="1" maxlength="128" pattern="[A-Za-z0-9._:-]+"></div><div class="field"><label for="reserved-web-certificate-id">管理访问证书标识</label><input id="reserved-web-certificate-id" required minlength="1" maxlength="128" pattern="[A-Za-z0-9._:-]+"></div><p id="device-form-error" class="form-error" role="alert" hidden></p><div class="dialog-actions"><button id="cancel-device" class="button secondary" type="button">取消</button><button id="save-device" class="button primary" type="submit">创建待处理预留</button></div></form></dialog>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
