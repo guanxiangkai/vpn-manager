@@ -31,3 +31,15 @@ TLS 证书和私钥存放在 `/etc/vpn-manager/web-api-fullchain.pem`、`web-api
 钩子将 Certbot 的目录和文件链接解析到受 root 控制的 `/etc/letsencrypt` 内，校验 IP、有效期、用途、私钥匹配和系统 CA 信任链。只有原先运行的 Web 服务会重启；随后从本机监听地址发起 HTTPS `/health` 探测，仍按公网 IP 校验证书。更新失败会恢复原证书并再次校验服务；恢复失败会明确报错。首次放置证书不会自动启动服务。
 
 IP 短期证书需要无人值守续期和到期监测，不能签发一次后长期不管。此钩子不修改 VPN 网关证书。
+
+## 指定 IP 证书自动续期
+
+`vpn-manager-web-certificate-renew.timer` 每天在 00:17 和 12:17 各触发一次，服务只调用带 `--cert-name` 的 Certbot `renew`，不会执行全局 `certbot renew`，不会自动接受 ToS，也不会创建新的 ACME 账户。Certbot 5.9 的续期配置必须已经由 root 人工完成；首次申请、账户注册和 ToS 确认不由 timer 代办。
+
+续期使用 standalone HTTP-01，固定探测并占用明确的 `:80`。若端口已被任何程序占用，续期直接失败，不会停止或接管该程序，也不会修改防火墙或 VPN。公网地址、证书名和本机 Web 监听地址必须由 root 在 service 的 `ExecStart` 中替换为真实值；示例中的 `PUBLIC_IP` 不是可运行配置。
+
+证书续期成功后复用 `deploy_web_certificate.py` 的证书链、IP SAN、服务端用途、私钥匹配、系统 CA、原值恢复和健康检查逻辑；只重启 `vpn-manager-web-api.service`。部署钩子失败、Web 仍使用旧证书、证书剩余有效期不足或恢复失败都会以非零状态退出并写入 systemd journal。timer 不接触 `ipsec`、家庭回程或 WireGuard。
+
+首次人工准备至少包括：在 `/etc/letsencrypt` 完成指定 IP 证书和账户配置、确认公网 TCP/80 能到达本机、确认 80 未被服务占用、将 unit 中的占位地址替换为真实地址，并在启用 timer 前手动执行一次 `--dry-run` 或 staging 验证。生产启用后仍须检查 journal、实际证书 SAN/有效期和 API HTTPS 健康响应。
+
+测试命令可在不部署、不重启 Web 的情况下运行：在续期服务参数末尾加入 `--dry-run`；该模式只执行指定证书的 Certbot 测试，明确不执行部署钩子。正式续期前会拒绝 Web 已停用的状态，绝不会自动启动停用服务。部署校验要求证书至少剩余 48 小时；160 小时是该类短期证书的 CA 生命周期，不是部署时必须剩余的时长。

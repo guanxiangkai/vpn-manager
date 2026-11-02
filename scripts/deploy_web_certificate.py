@@ -33,8 +33,8 @@ def validate(certificate: bytes, key: bytes, address: str) -> None:
         raise ValueError("证书链为空")
     leaf = certificates[0]
     now = datetime.now(timezone.utc)
-    if leaf.not_valid_before_utc > now or leaf.not_valid_after_utc < now + timedelta(hours=12):
-        raise ValueError("证书尚未生效或剩余有效期不足 12 小时")
+    if leaf.not_valid_before_utc > now or leaf.not_valid_after_utc < now + timedelta(hours=48):
+        raise ValueError("证书尚未生效或剩余有效期不足 48 小时")
     addresses = leaf.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
     if ip_address(address) not in addresses.get_values_for_type(x509.IPAddress):
         raise ValueError("证书未覆盖 API 公网 IP")
@@ -180,6 +180,20 @@ def _deploy(source: Path, address: str, bind: str, port: int, *, destination: Pa
         raise RuntimeError("证书部署失败；原证书已恢复，原运行服务已重新验证") from failure
 
 
+def deploy_with_lock(source: Path, address: str, bind: str, port: int, *, destination: Path = Path("/etc/vpn-manager"), require_active: bool = False) -> None:
+    """以与 CLI 相同的 root 锁执行部署，供受控续期入口复用。"""
+    _secure_directory(destination)
+    descriptor = os.open(destination / "web-certificate.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "r+") as lock:
+        mode = os.fstat(lock.fileno())
+        if not stat.S_ISREG(mode.st_mode) or mode.st_uid != ROOT_UID or mode.st_mode & 0o077:
+            raise RuntimeError("证书部署锁不安全")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if require_active and not _active():
+            raise RuntimeError("Web 服务未运行，拒绝续期部署；不会自动启动服务")
+        _deploy(source, address, bind, port, destination=destination)
+
+
 def main() -> None:
     """串行部署 Certbot 的续期证书；仅重启 Web，失败则恢复原证书。"""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -196,13 +210,7 @@ def main() -> None:
         parser.error("健康检查必须使用明确的本机私有 IP 和非特权端口")
     directory = Path("/etc/vpn-manager")
     _secure_directory(directory)
-    descriptor = os.open(directory / "web-certificate.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(descriptor, "r+") as lock:
-        mode = os.fstat(lock.fileno())
-        if not stat.S_ISREG(mode.st_mode) or mode.st_uid != ROOT_UID or mode.st_mode & 0o077:
-            raise RuntimeError("证书部署锁不安全")
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        _deploy(args.certificate_directory, args.address, str(bind), args.port)
+    deploy_with_lock(args.certificate_directory, args.address, str(bind), args.port, destination=directory)
 
 
 if __name__ == "__main__":

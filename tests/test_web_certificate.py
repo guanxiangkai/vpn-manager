@@ -40,6 +40,7 @@ def test_valid_certificate_metadata():
 @pytest.mark.parametrize("options", [
     {"address": "203.0.113.11"},
     {"remaining_hours": 1},
+    {"remaining_hours": 47},
     {"before_hours": 1},
     {"server": False},
 ])

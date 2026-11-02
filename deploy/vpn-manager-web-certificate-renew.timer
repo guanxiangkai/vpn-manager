@@ -1,0 +1,11 @@
+[Unit]
+Description=定时续期 VPN 管理 Web API 的指定 IP 证书
+
+[Timer]
+OnCalendar=*-*-* 00,12:17:00
+Persistent=true
+RandomizedDelaySec=10m
+Unit=vpn-manager-web-certificate-renew.service
+
+[Install]
+WantedBy=timers.target
