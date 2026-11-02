@@ -32,7 +32,7 @@ def sign_in(client, username="owner"):
 def test_cross_site_login_permissions_and_hashed_session(client):
     browser, database = client
     owner, member = sign_in(browser), sign_in(browser, "member")
-    assert browser.get("/api/auth/me").status_code == 401
+    assert browser.get("/api/auth/me", headers={"Origin": ALLOWED_ORIGIN}).status_code == 401
     assert browser.get("/api/auth/me", headers=owner).json()["networks"] == ["home", "work"]
     assert browser.get("/api/auth/me", headers=member).json()["networks"] == ["work"]
     assert browser.get("/api/admin/users", headers=member).status_code == 403
@@ -52,7 +52,7 @@ def test_cors_allows_exact_origin_and_authorization_header_only(client):
     assert "access-control-allow-credentials" not in response.headers
     for origin in ["https://evil.example", "null", "http://slimjoy.cn", "https://slimjoy.cn.evil.example"]:
         response = browser.options("/api/admin/users", headers={**preflight, "Origin": origin})
-        assert response.status_code == 400
+        assert response.status_code == 403
         assert "access-control-allow-origin" not in response.headers
         response = browser.post("/api/auth/login", headers={"Origin": origin}, json={"username": "owner", "password": "owner-example-password"})
         assert response.status_code == 403
@@ -62,11 +62,43 @@ def test_bearer_mode_rejects_cookie_and_ambiguous_authorization(client):
     browser, _ = client
     headers = sign_in(browser)
     token = headers["Authorization"].removeprefix("Bearer ")
-    assert browser.get("/api/auth/me", headers={"Cookie": f"{COOKIE_NAME}={token}"}).status_code == 401
+    assert browser.get("/api/auth/me", headers={"Origin": ALLOWED_ORIGIN, "Cookie": f"{COOKIE_NAME}={token}"}).status_code == 401
     assert browser.get("/api/auth/me", headers={**headers, "Cookie": f"{COOKIE_NAME}={token}"}).status_code == 401
-    assert browser.get("/api/auth/me", headers=[("Authorization", headers["Authorization"]), ("Authorization", headers["Authorization"])]).status_code == 401
+    assert browser.get("/api/auth/me", headers=[("Origin", ALLOWED_ORIGIN), ("Authorization", headers["Authorization"]), ("Authorization", headers["Authorization"])]).status_code == 401
     for value in [f"Basic {token}", f"Bearer  {token}", "Bearer broken"]:
-        assert browser.get("/api/auth/me", headers={"Authorization": value}).status_code == 401
+        assert browser.get("/api/auth/me", headers={"Origin": ALLOWED_ORIGIN, "Authorization": value}).status_code == 401
+
+
+def test_public_api_checks_origin_before_read_write_and_preflight(client):
+    browser, database = client
+    owner = sign_in(browser)
+    with sqlite3.connect(database) as connection:
+        attempts_before = connection.execute("SELECT COUNT(*) FROM login_attempts").fetchone()[0]
+    for origins in [[], [("Origin", "null")], [("Origin", "https://evil.example")],
+                    [("Origin", "http://slimjoy.cn")], [("Origin", "https://slimjoy.cn.evil.example")],
+                    [("Origin", ALLOWED_ORIGIN), ("Origin", ALLOWED_ORIGIN)],
+                    [("Origin", ALLOWED_ORIGIN), ("Origin", "https://evil.example")]]:
+        headers = [(k,v) for k,v in owner.items() if k != "Origin"] + origins
+        requests = [
+            ("GET", "/api/auth/me", {}),
+            ("GET", "/api/admin/users", {}),
+            ("GET", "/api/admin/audit", {}),
+            ("PATCH", "/api/admin/users/member", {"json": {"active": False}}),
+            ("POST", "/api/auth/login", {"json": {"username": "owner", "password": "owner-example-password"}}),
+            ("OPTIONS", "/api/admin/users", {}),
+        ]
+        for method, path, options in requests:
+            response = browser.request(method, path, headers=headers, **options)
+            assert response.status_code == 403
+            assert response.json()["error"]["code"] == "origin_forbidden"
+            assert "access-control-allow-origin" not in response.headers
+            assert response.headers["cache-control"] == "no-store"
+    # 被来源检查拒绝的请求不会冻结账户或进入账户修改逻辑。
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM login_attempts").fetchone()[0] == attempts_before
+    assert browser.get("/api/admin/users", headers=owner).status_code == 200
+    assert sign_in(browser, "member")
+    assert browser.get("/health").json() == {"message": "ok"}
 
 
 def test_mutations_recheck_origin_csrf_and_revoke_changed_accounts(client):

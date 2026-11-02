@@ -68,6 +68,8 @@ python -m vpn_manager.runtime --bind INTERNAL_IP --port 8443 \
 - 同源 `cookie` 模式使用 `credentials: "include"`，登录返回 `{ "user": UserView, "csrf_token": string }`，会话通过安全 Cookie 传递。`POST /api/auth/refresh` 依赖已有 Cookie 与严格 Origin，返回扁平 `UserView` 字段和新的 `csrf_token`。
 - OSS 跨站 `bearer` 模式使用 `credentials: "omit"`，登录响应另含 `session_token`；前端仅在内存中保存，并通过 `Authorization: Bearer ...` 发送。刷新页面或关闭页面后需重新登录，不能借助 Cookie 恢复会话。
 
+OSS 跨站模式下，所有 `/api` 请求（包括读取和预检）必须携带唯一且精确匹配 `VPN_MANAGER_ORIGIN` 的 `Origin`；来源缺失、重复、`null` 或其他域名均返回 `403 origin_forbidden`。`GET /health` 仅返回存活状态，供服务监测使用。来源检查用于限制浏览器跨站调用；非浏览器工具可以伪造这个请求头，因此账户密码、会话、CSRF 和角色权限仍是必要的准入校验。同源 Cookie 模式的读取请求可不携带 Origin，写入仍严格校验来源。
+
 `GET /api/auth/me` 仅返回 `UserView`，不轮换 CSRF。所有状态修改请求必须携带最新的 `X-CSRF-Token`；错误体为 `{ "error": { "code": string, "message": string } }`。
 
 接口包括：

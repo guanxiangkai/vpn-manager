@@ -42,14 +42,14 @@ def public_user(user: dict[str, Any]) -> dict[str, Any]:
 
 
 def require_origin(request: Request) -> None:
-    if request.headers.get("origin") != request.app.state.allowed_origin:
+    if request.headers.getlist("origin") != [request.app.state.allowed_origin]:
         raise ApiError(403, "origin_forbidden", "请求来源不被允许。")
 
 
 class RequestBoundaryMiddleware:
-    """请求体上限和响应安全头；身份认证由账户密码及服务端会话完成。"""
-    def __init__(self, app):
-        self.app = app
+    """请求来源、请求体上限和安全头；身份认证仍由账户及会话完成。"""
+    def __init__(self, app, *, api_origin: str | None = None):
+        self.app, self.api_origin = app, api_origin
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -66,6 +66,15 @@ class RequestBoundaryMiddleware:
 
         async def error(status, code, message):
             await JSONResponse({"error":{"code":code,"message":message}}, status_code=status)(scope,receive,secured_send)
+
+        # OSS 跨站模式的读取、写入和预检都检查同一个精确来源。
+        # Origin 可被非浏览器客户端伪造，因此不能取代登录、CSRF 和权限校验。
+        path = scope.get("path", "")
+        if self.api_origin is not None and (path == "/api" or path.startswith("/api/")):
+            origins = [v.decode("latin-1") for k,v in scope.get("headers",[]) if k.lower() == b"origin"]
+            if origins != [self.api_origin]:
+                await error(403,"origin_forbidden","请求来源不被允许。")
+                return
 
         lengths = [v for k,v in scope.get("headers",[]) if k.lower()==b"content-length"]
         try:
@@ -108,7 +117,7 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
     app.state.store, app.state.allowed_origin = store, allowed_origin
     app.state.gateway_public_key, app.state.gateway_client = gateway_public_key, gateway_client
     app.add_middleware(CORSMiddleware,allow_origins=[allowed_origin],allow_credentials=session_transport == "cookie",allow_methods=["GET","POST","PATCH","OPTIONS"],allow_headers=["Content-Type","X-CSRF-Token","Authorization"],max_age=600)
-    app.add_middleware(RequestBoundaryMiddleware)
+    app.add_middleware(RequestBoundaryMiddleware, api_origin=allowed_origin if session_transport == "bearer" else None)
     password_slots = BoundedSemaphore(2)
     dummy_hash = hash_password(new_secret())
 
