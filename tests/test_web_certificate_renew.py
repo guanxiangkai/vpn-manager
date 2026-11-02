@@ -25,8 +25,19 @@ def test_certbot_command_is_named_and_not_global(monkeypatch, tmp_path):
     assert "--authenticator" in command and "standalone" in command
     assert "--http-01-port" in command and "80" in command
     assert "--no-directory-hooks" in command
+    assert "--ip-address" not in command
     assert "--all" not in command
     assert kwargs["check"] is True and kwargs.get("shell") is not True
+
+
+def test_certbot_uses_installed_executable_and_exact_probe_address(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(renew.subprocess, "run", lambda command, **kwargs: calls.append(command) or SimpleNamespace())
+    renew._run_certbot("vpn-manager-web-ip", "8.159.154.136", tmp_path,
+                      bind="192.168.0.169", certbot="/opt/vpn-manager/certbot-venv/bin/certbot")
+    command = calls[0]
+    assert command[0] == "/opt/vpn-manager/certbot-venv/bin/certbot"
+    assert command[command.index("--http-01-address") + 1] == "192.168.0.169"
 
 
 def test_certbot_dry_run_does_not_deploy(monkeypatch, tmp_path):
@@ -68,3 +79,5 @@ def test_service_and_timer_are_independent_and_twice_daily():
     assert "vpn-manager-web-certificate-renew.service" in timer
     assert "00,12:17:00" in timer
     assert "PUBLIC_IP" in service
+    assert "PRIVATE_IP" in service and "--bind 0.0.0.0" not in service
+    assert "/opt/vpn-manager/certbot-venv/bin/certbot" in service

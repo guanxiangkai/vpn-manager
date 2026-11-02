@@ -36,15 +36,18 @@ def _assert_port_free(bind: str, port: int) -> None:
             raise RuntimeError(f"HTTP-01 端口 {bind}:{port} 已被占用，拒绝续期") from error
 
 
-def _run_certbot(cert_name: str, address: str, certbot_root: Path, *, dry_run: bool = False) -> None:
-    command = [CERTBOT, "renew", "--cert-name", cert_name, "--non-interactive",
+def _run_certbot(cert_name: str, address: str, certbot_root: Path, *, bind: str = "127.0.0.1",
+                 certbot: str = CERTBOT, dry_run: bool = False) -> None:
+    command = [certbot, "renew", "--cert-name", cert_name, "--non-interactive",
                "--authenticator", "standalone", "--preferred-challenges", "http-01",
-               "--http-01-port", "80", "--no-directory-hooks", "--config-dir", str(certbot_root),
+               "--http-01-port", "80", "--http-01-address", bind,
+               "--no-directory-hooks", "--config-dir", str(certbot_root),
                "--work-dir", str(certbot_root / "work"), "--logs-dir", str(certbot_root / "logs")]
     # IP SAN 与 cert-name 都来自受控 unit 参数；不拼接 shell 命令。
     if dry_run:
         command.append("--dry-run")
-    subprocess.run(command + ["--ip-address", address], check=True, capture_output=True,
+    # renew 沿用指定证书的续期配置，不重新提交 --ip-address 申请参数。
+    subprocess.run(command, check=True, capture_output=True,
                    text=True, timeout=180)
 
 
@@ -55,6 +58,7 @@ def main() -> None:
     parser.add_argument("--bind", required=True)
     parser.add_argument("--certificate-directory", required=True, type=Path)
     parser.add_argument("--certbot-root", default="/etc/letsencrypt", type=Path)
+    parser.add_argument("--certbot", default=CERTBOT, help="已安装的 Certbot 绝对路径")
     parser.add_argument("--port", default=80, type=int)
     parser.add_argument("--web-bind", default="127.0.0.1")
     parser.add_argument("--web-port", default=8443, type=int)
@@ -74,10 +78,16 @@ def main() -> None:
         parser.error("Web 健康检查端口无效")
     certbot_root = _root_path(str(args.certbot_root), "Certbot 根目录")
     certificate_directory = _root_path(str(args.certificate_directory), "证书目录")
+    certbot = _root_path(args.certbot, "Certbot 程序")
+    deployment._secure_directory(certbot.parent)
+    executable = certbot.lstat()
+    if not stat.S_ISREG(executable.st_mode) or executable.st_uid != ROOT_UID or executable.st_mode & 0o022 or not os.access(certbot, os.X_OK):
+        parser.error("Certbot 程序必须由 root 控制且可执行")
     deployment._secure_directory(certbot_root)
     deployment._secure_directory(certificate_directory.parent)
     _assert_port_free(str(bind), 80)
-    _run_certbot(args.cert_name, str(address), certbot_root, dry_run=args.dry_run)
+    _run_certbot(args.cert_name, str(address), certbot_root, bind=str(bind),
+                 certbot=str(certbot), dry_run=args.dry_run)
     if args.dry_run:
         return
     # 复用既有完整证书链验证、原值恢复和仅重启 Web 的部署逻辑。
