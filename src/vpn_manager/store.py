@@ -11,7 +11,7 @@ from typing import Iterator
 
 from .security import token_hash, utc_text
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 MAX_ENROLLED_DEVICES = 10
 
 
@@ -62,7 +62,7 @@ class Store:
             tables = {r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             old = connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone() if "schema_metadata" in tables else None
             version = old[0] if old else None
-            if version not in {None, "1", "2", "3", "4", "5", "6"}:
+            if version not in {None, "1", "2", "3", "4", "5", "6", "7"}:
                 raise RuntimeError("不支持的数据库结构版本")
             if version is None and tables - {"sqlite_sequence"}:
                 raise RuntimeError("已有数据库缺少结构版本，拒绝猜测迁移")
@@ -113,7 +113,27 @@ class Store:
                 for username in affected_users:
                     self.revoke_sessions(connection, username)
                 self.audit(connection, actor=None, source_ip=None, action="user_network_policy_upgrade", target="user_work_only_v6", outcome="success")
+            # 增量创建目录，不重写既有授权表、会话、网关版本或路由。
+            connection.execute("""CREATE TABLE IF NOT EXISTS network_catalog (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                description TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('existing','draft')),
+                version INTEGER NOT NULL CHECK(version>=1), created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+            if version != "7":
+                now = utc_text()
+                connection.executemany("INSERT INTO network_catalog(id,name,description,state,version,created_at,updated_at) VALUES (?,?,?,'existing',1,?,?) ON CONFLICT(id) DO NOTHING", [
+                    ("home", "家庭", "家庭局域网资源", now, now),
+                    ("work", "工作", "工作内网资源", now, now),
+                ])
+                self.audit(connection, actor=None, source_ip=None, action="network_catalog_upgrade", target="network_catalog_v7", outcome="success")
             connection.execute("INSERT INTO schema_metadata(key,value) VALUES ('schema_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(SCHEMA_VERSION),))
+
+    def list_networks(self, username: str | None = None) -> list[dict]:
+        with self.connect() as connection:
+            if username is None:
+                rows = connection.execute("SELECT * FROM network_catalog ORDER BY created_at,id")
+            else:
+                rows = connection.execute("SELECT n.* FROM network_catalog n JOIN user_networks u ON u.network=n.id WHERE u.username=? ORDER BY n.created_at,n.id", (username,))
+            return [dict(row) for row in rows]
 
     @staticmethod
     def user_from_row(connection, row) -> dict | None:

@@ -11,7 +11,7 @@ import pytest
 from vpn_manager.app import ALLOWED_ORIGIN, create_app
 from vpn_manager.bootstrap import bootstrap
 from vpn_manager.security import COOKIE_NAME, hash_password, token_hash, utc_text
-from vpn_manager.store import DeviceQuotaExceeded, Store
+from vpn_manager.store import DeviceQuotaExceeded, SCHEMA_VERSION, Store
 
 
 @pytest.fixture()
@@ -385,7 +385,7 @@ def test_migration_retains_accounts_history_and_rejects_old_sessions(tmp_path,ve
     Store(path).initialize()
     assert client.get('/api/auth/me').status_code==200
     with Store(path).connect() as c:
-        assert c.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0]=='6'
+        assert c.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == str(SCHEMA_VERSION)
         assert c.execute('SELECT revoked_at FROM sessions WHERE token_hash=?',(token_hash('old-cookie'),)).fetchone()[0]
         assert c.execute("SELECT COUNT(*) FROM audit_events WHERE action='authentication_schema_upgrade'").fetchone()[0]==1
         assert c.execute("SELECT COUNT(*) FROM audit_events WHERE action='historical_login'").fetchone()[0] == 1
@@ -408,7 +408,7 @@ def test_schema_v4_migrates_to_gateway_v6_without_projecting_existing_accounts(t
     Store(path).initialize()
     assert Store(path).gateway_status('legacy')['state'] == 'not_provisioned'
     with sqlite3.connect(path) as connection:
-        assert connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == '6'
+        assert connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == str(SCHEMA_VERSION)
         assert connection.execute("SELECT COUNT(*) FROM audit_events WHERE action='gateway_schema_upgrade'").fetchone()[0] == 1
 
 
@@ -425,7 +425,7 @@ def test_schema_v5_migration_normalizes_legacy_user_networks(tmp_path):
     assert Store(path).find_user('member')['networks'] == ['work']
     assert client.get('/api/auth/me').status_code == 401
     with Store(path).connect() as connection:
-        assert connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == '6'
+        assert connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == str(SCHEMA_VERSION)
         assert connection.execute("SELECT COUNT(*) FROM audit_events WHERE action='user_network_policy_upgrade'").fetchone()[0] == 1
 
 

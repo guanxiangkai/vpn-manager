@@ -76,9 +76,14 @@ OSS 跨站模式下，所有 `/api` 请求（包括读取和预检）必须携�
 
 - 认证：`GET /health`、`POST /api/auth/login`、`POST /api/auth/logout`、`POST /api/auth/refresh`、`GET /api/auth/me`。
 - 本人设备记录：`GET /api/devices`、`POST /api/devices/{device_id}/remove`。
+- 网络目录：`GET /api/networks` 只返回本人已授权网络；管理员使用 `GET/POST /api/admin/networks`、`PATCH /api/admin/networks/{id}` 维护名称、说明与草稿。修改时提交 `version`，旧版本返回 `409 network_version_conflict`。新增为草稿，不能直接用于账户授权或自动接通 VPN。
 - 管理员：`GET/POST /api/admin/users`、`PATCH /api/admin/users/{username}`、`POST /api/admin/users/{username}/deactivate`、`GET /api/admin/audit?cursor=&limit=20`、`GET/POST /api/admin/users/{username}/devices`、`POST /api/admin/users/{username}/devices/{device_id}/remove`。
 
 创建设备记录的请求体只有 `{ "device_id": string }`。`DeviceView` 为 `account_id`、`device_id`、`state`（`registered` 或 `removed`）、`created_at`、`updated_at`；移除记录不等于撤销 VPN 访问。
+
+`UserView.protected` 标记固定系统管理员 `guanxiangkai`。该账户不能降级或停用，服务端在事务中返回 `409 system_admin_protected`，其他管理员也不能绕过。其密码、网络授权仍走既有更新及审计流程；普通用户仍只能拥有工作网络权限。
+
+网络目录迁移将数据库 v6 增量升级到 v7，保留既有账户、会话和授权。目录编辑不生成网关投递任务；改名不更换网络标识。旧代码拒绝 v7 数据库，恢复时必须使用发布前一致快照和对应旧代码，不能只回退程序。
 
 ## 网关权限与恢复
 

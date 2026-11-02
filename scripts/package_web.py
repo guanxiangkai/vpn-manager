@@ -5,11 +5,10 @@ import hashlib
 import html
 import json
 from pathlib import Path
-import shutil
 from urllib.parse import urlsplit
 
 
-def package(source: Path, destination: Path, api_origin: str) -> dict:
+def package(source: Path, destination: Path, api_origin: str, *, fingerprint_assets: bool = False) -> dict:
     parsed = urlsplit(api_origin)
     if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
             or parsed.path not in {"", "/"} or parsed.query or parsed.fragment):
@@ -26,10 +25,24 @@ def package(source: Path, destination: Path, api_origin: str) -> dict:
     if document.count(before) != 1:
         raise ValueError("页面 CSP 模板不唯一")
     document = document.replace(before, f"connect-src 'self' {html.escape(origin, quote=True)};")
+    assets = {}
+    for name in ("app.js", "styles.css"):
+        content = (source / name).read_bytes()
+        output_name = name
+        if fingerprint_assets:
+            asset = Path(name)
+            digest = hashlib.sha256(content).hexdigest()[:16]
+            output_name = f"{asset.stem}.{digest}{asset.suffix}"
+            attribute = f'="{name}"'
+            if document.count(attribute) != 1:
+                raise ValueError(f"页面资源引用不唯一：{name}")
+            document = document.replace(attribute, f'="{output_name}"')
+        assets[output_name] = content
     destination.mkdir(parents=True)
     (destination / "index.html").write_text(document, encoding="utf-8")
-    for name in ("app.js", "styles.css"):
-        shutil.copyfile(source / name, destination / name)
+    # 先上传带内容指纹的资源，最后替换首页，可避免读到新旧混合的页面。
+    for name, content in assets.items():
+        (destination / name).write_bytes(content)
     (destination / "config.json").write_text(json.dumps({"apiBaseUrl": origin, "sessionTransport": "bearer"}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return {item.name: {"bytes": item.stat().st_size, "sha256": hashlib.sha256(item.read_bytes()).hexdigest()} for item in sorted(destination.iterdir())}
 
@@ -38,8 +51,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--api-origin", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--fingerprint-assets", action="store_true", help="为 JS/CSS 添加内容指纹，支持先资源后首页发布")
     args = parser.parse_args()
-    print(json.dumps(package(Path(__file__).resolve().parents[1] / "web", args.output, args.api_origin), ensure_ascii=False, indent=2))
+    print(json.dumps(package(Path(__file__).resolve().parents[1] / "web", args.output, args.api_origin, fingerprint_assets=args.fingerprint_assets), ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

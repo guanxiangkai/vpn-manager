@@ -65,6 +65,7 @@ class UserView(StrictModel):
     role: Role
     networks: list[Network]
     active: bool
+    protected: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -131,3 +132,47 @@ class ErrorDetail(StrictModel):
 
 class ErrorResponse(StrictModel):
     error: ErrorDetail
+
+
+class NetworkCreate(StrictModel):
+    """这里只维护目录资料；新增目录不能自动变成可用的 VPN 路由。"""
+
+    name: str = Field(min_length=1, max_length=64)
+    description: str = Field(default="", max_length=256)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        value = value.strip()
+        if any(ord(char) < 32 for char in value):
+            raise ValueError("网络名称不能包含控制字符")
+        return value
+
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, value: str) -> str:
+        value = value.strip()
+        if any(ord(char) < 32 and char not in "\n\r\t" for char in value):
+            raise ValueError("网络说明不能包含不可见控制字符")
+        return value
+
+    @model_validator(mode="after")
+    def name_is_not_blank(self) -> "NetworkCreate":
+        if not self.name:
+            raise ValueError("网络名称不能为空")
+        return self
+
+
+class NetworkUpdate(NetworkCreate):
+    version: int = Field(ge=1)
+
+
+class NetworkView(StrictModel):
+    id: str
+    name: str
+    description: str
+    # existing 只表示沿用的权限标识，不宣称网关已切换或 VPN 正在连接。
+    state: Literal["existing", "draft"]
+    version: int = Field(ge=1)
+    created_at: datetime
+    updated_at: datetime

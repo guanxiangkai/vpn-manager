@@ -1,5 +1,6 @@
 # 工厂内部依赖的注解需要立即求值，不能启用 postponed annotations。
 import sqlite3
+import uuid
 from datetime import datetime, timedelta
 from ipaddress import ip_address
 from pathlib import Path
@@ -14,7 +15,7 @@ from fastapi.responses import JSONResponse
 from starlette.staticfiles import StaticFiles
 
 from .gateway_sync import GatewayClient, GatewayUnavailable, seal_credential
-from .models import AuditPage, DeviceCreate, DeviceView, ErrorResponse, GatewayStatus, LoginRequest, LoginResponse, MeResponse, MessageResponse, UserCreate, UserUpdate, UserView
+from .models import AuditPage, DeviceCreate, DeviceView, ErrorResponse, GatewayStatus, LoginRequest, LoginResponse, MeResponse, MessageResponse, NetworkCreate, NetworkUpdate, NetworkView, UserCreate, UserUpdate, UserView
 from .security import COOKIE_NAME, SESSION_TTL, hash_password, needs_rehash, new_secret, token_hash, utc_now, utc_text, verify_password
 from .store import DeviceConflict, DeviceQuotaExceeded, Store
 
@@ -22,6 +23,8 @@ ALLOWED_ORIGIN = "https://slimjoy.cn"
 LOGIN_WINDOW = timedelta(minutes=15)
 LOGIN_ATTEMPT_LIMIT = 5
 MAX_REQUEST_BODY_BYTES = 16 * 1024
+# 本部署的系统管理员是固定主体；不能通过新建其他管理员绕过保护。
+SYSTEM_ADMIN_USERNAME = "guanxiangkai"
 
 
 class ApiError(Exception):
@@ -38,7 +41,8 @@ def source_ip(request: Request) -> str:
 
 
 def public_user(user: dict[str, Any]) -> dict[str, Any]:
-    return {k: user[k] for k in ("username", "role", "networks", "active", "created_at", "updated_at")}
+    return {**{k: user[k] for k in ("username", "role", "networks", "active", "created_at", "updated_at")},
+            "protected": user["username"] == SYSTEM_ADMIN_USERNAME}
 
 
 def require_origin(request: Request) -> None:
@@ -311,6 +315,43 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
             raise ApiError(404,"device_not_found","未找到设备记录。")
         return item
 
+    @app.get("/api/networks", response_model=list[NetworkView])
+    def own_networks(user: Annotated[dict, Depends(current_user)]):
+        # 普通账户只读取自身授权的网络资料，草稿和其他网络不会泄露。
+        return store.list_networks(user["username"])
+
+    @app.get("/api/admin/networks", response_model=list[NetworkView])
+    def list_networks(_: Annotated[dict, Depends(admin_user)]):
+        return store.list_networks()
+
+    @app.post("/api/admin/networks", response_model=NetworkView, status_code=201)
+    def create_network(payload: NetworkCreate, request: Request, _: Annotated[dict, Depends(admin_mutation_user)]):
+        with store.write_transaction() as connection:
+            actor = authorize_write(connection, request, admin=True)
+            identifier, now = "net-" + uuid.uuid4().hex, utc_text()
+            try:
+                connection.execute("INSERT INTO network_catalog(id,name,description,state,version,created_at,updated_at) VALUES (?,?,?,'draft',1,?,?)", (identifier, payload.name, payload.description, now, now))
+            except sqlite3.IntegrityError:
+                raise ApiError(409, "network_name_conflict", "此网络名称已存在。")
+            store.audit(connection, actor=actor["username"], source_ip=source_ip(request), action="network_create", target=identifier, outcome="success")
+            return dict(connection.execute("SELECT * FROM network_catalog WHERE id=?", (identifier,)).fetchone())
+
+    @app.patch("/api/admin/networks/{network_id}", response_model=NetworkView)
+    def update_network(network_id: str, payload: NetworkUpdate, request: Request, _: Annotated[dict, Depends(admin_mutation_user)]):
+        with store.write_transaction() as connection:
+            actor = authorize_write(connection, request, admin=True)
+            current = connection.execute("SELECT * FROM network_catalog WHERE id=?", (network_id,)).fetchone()
+            if current is None:
+                raise ApiError(404, "network_not_found", "未找到此网络。")
+            if current["version"] != payload.version:
+                raise ApiError(409, "network_version_conflict", "此网络已被其他操作修改，请刷新列表后重新编辑。")
+            try:
+                connection.execute("UPDATE network_catalog SET name=?,description=?,version=version+1,updated_at=? WHERE id=?", (payload.name, payload.description, utc_text(), network_id))
+            except sqlite3.IntegrityError:
+                raise ApiError(409, "network_name_conflict", "此网络名称已存在。")
+            store.audit(connection, actor=actor["username"], source_ip=source_ip(request), action="network_update", target=network_id, outcome="success")
+            return dict(connection.execute("SELECT * FROM network_catalog WHERE id=?", (network_id,)).fetchone())
+
     @app.get("/api/admin/users", response_model=list[UserView], responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}})
     def list_users(_: Annotated[dict[str, Any], Depends(admin_user)]) -> list[dict[str, Any]]:
         return [public_user(item) for item in store.list_users()]
@@ -333,6 +374,8 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
         return public_user(created)
 
     def protect_last_admin(connection: Any, current: dict[str, Any], next_role: str, next_active: bool) -> None:
+        if current["username"] == SYSTEM_ADMIN_USERNAME and (next_role != "admin" or not next_active):
+            raise ApiError(409, "system_admin_protected", "系统管理员不能降级或停用。")
         if current["active"] and current["role"] == "admin" and (next_role != "admin" or not next_active):
             count = connection.execute("SELECT COUNT(*) AS count FROM users WHERE role = 'admin' AND active = 1").fetchone()["count"]
             if count <= 1:

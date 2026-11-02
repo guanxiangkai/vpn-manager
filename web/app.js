@@ -1,5 +1,5 @@
 const DEFAULT_AUDIT_LIMIT = 20;
-const state = { apiBaseUrl: "", sessionTransport: "cookie", sessionToken: null, csrfToken: null, user: null, usersSerial: 0, ownDevicesSerial: 0, deviceSerial: 0, deviceAccountsSerial: 0, deviceAccounts: [], selectedDeviceAccount: null, auditCursors: [null], auditIndex: 0, auditSerial: 0, requestIds: new Map() };
+const state = { apiBaseUrl: "", sessionTransport: "cookie", sessionToken: null, csrfToken: null, user: null, users: [], usersSerial: 0, ownDevicesSerial: 0, deviceSerial: 0, deviceAccountsSerial: 0, deviceAccounts: [], selectedDeviceAccount: null, auditCursors: [null], auditIndex: 0, auditSerial: 0, networks: [], networkNames: new Map(), networksSerial: 0, editingNetwork: null, userDialogSerial: 0, requestIds: new Map() };
 
 const $ = (selector) => document.querySelector(selector);
 const elements = {
@@ -19,8 +19,10 @@ function showError(element, message) { element.textContent = message; element.hi
 function clearError(element) { element.textContent = ""; element.hidden = true; }
 function setPanel(element, kind, message) { element.className = `state-panel${kind ? ` ${kind}` : ""}`; element.textContent = message; element.hidden = false; }
 function setBusy(button, busy, busyText) { if (!button.dataset.label) button.dataset.label = button.textContent; button.disabled = busy; button.textContent = busy ? busyText : button.dataset.label; }
-function roleText(role) { return role === "admin" ? "管理员" : "普通用户"; }
-function networkText(network) { return network === "home" ? "家庭" : "工作"; }
+function roleText(role, protectedAccount = false) { return protectedAccount ? "超级管理员" : role === "admin" ? "管理员" : "普通用户"; }
+function networkInfo(network) { return state.networkNames.get(network); }
+function networkText(network) { return networkInfo(network)?.name || network; }
+function networkIcon(network) { return ["home", "work"].includes(network) ? network : "network"; }
 function deviceStateText(value) { return ({ registered: "已登记", removed: "已移除" })[value] || value; }
 function humanError(error) {
   return error.message;
@@ -30,6 +32,37 @@ function protocolError(name) { return new Error(`服务返回的${name}格式不
 function expectArray(value, name) { if (!Array.isArray(value)) throw protocolError(name); return value; }
 function statusBadge(value, type = "active") { const span = document.createElement("span"); span.className = `status ${type}`; span.textContent = value; return span; }
 function apiUrl(path) { return `${state.apiBaseUrl}${path}`; }
+
+// 页面中的动态资料只通过 textContent 写入；图标引用来自本地固定符号集。
+function textElement(tag, text, className = "") {
+  const element = document.createElement(tag);
+  element.textContent = text;
+  if (className) element.className = className;
+  return element;
+}
+function icon(name) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "icon");
+  svg.setAttribute("aria-hidden", "true");
+  const use = document.createElementNS(svg.namespaceURI, "use");
+  use.setAttribute("href", `#i-${name}`);
+  svg.append(use);
+  return svg;
+}
+function emptyRow(body, columns, title, detail = "") {
+  const row = document.createElement("tr");
+  const cell = textElement("td", "", "empty-cell");
+  cell.colSpan = columns;
+  cell.append(textElement("strong", title));
+  if (detail) cell.append(textElement("span", detail));
+  row.append(cell);
+  body.append(row);
+}
+function networkTag(network) {
+  const tag = textElement("span", "", `network-tag ${networkIcon(network)}`);
+  tag.append(icon(networkIcon(network)), document.createTextNode(networkText(network)));
+  return tag;
+}
 
 async function loadConfig() {
   try {
@@ -96,22 +129,65 @@ async function apiRequest(path, options = {}) {
 function renderProfile(user) {
   state.user = user;
   $("#profile-username").textContent = user.username;
-  $("#profile-role").textContent = roleText(user.role);
+  $("#profile-role").textContent = roleText(user.role, user.protected);
   const status = $("#profile-status"); status.replaceChildren(statusBadge(user.active ? "启用" : "已停用", user.active ? "active" : "inactive"));
-  elements.networkList.replaceChildren(...user.networks.map((network) => { const tag = document.createElement("span"); tag.className = "network-tag"; tag.textContent = networkText(network); return tag; }));
-  elements.signedInUser.textContent = `${user.username} · ${roleText(user.role)}`;
+  $("#network-count").textContent = `${user.networks.length} 个网络`;
+  renderAuthorizedNetworks(user);
+  loadNetworkMetadata(user);
+  $("#user-avatar").textContent = user.username.slice(0, 1).toUpperCase();
+  elements.signedInUser.replaceChildren(document.createTextNode(user.username), textElement("small", roleText(user.role, user.protected)));
   document.querySelectorAll(".admin-only").forEach((item) => { item.hidden = user.role !== "admin"; });
   loadOwnDevices();
   loadVpnStatus(user);
   elements.profileContent.hidden = false; elements.profileState.hidden = true;
 }
 
+function renderAuthorizedNetworks(user) {
+  elements.networkList.replaceChildren(...user.networks.map((network) => {
+    const card = textElement("article", "", "network-card");
+    const main = textElement("div", "", "network-card-main");
+    const image = textElement("span", "", `network-icon ${networkIcon(network)}`);
+    image.append(icon(networkIcon(network)));
+    const copy = textElement("div", "", "network-card-copy");
+    copy.append(textElement("h3", networkText(network)), textElement("p", networkInfo(network)?.description || "此账户已获授权的网络"));
+    main.append(image, copy, statusBadge("已授权"));
+    const footer = textElement("div", "", "network-card-footer");
+    footer.append(textElement("span", "权限已分配 · 连接状态以系统为准"), icon("shield"));
+    card.append(main, footer);
+    return card;
+  }));
+  if (user.networks.length === 0) elements.networkList.append(textElement("p", "当前没有已授权网络，请联系管理员。", "state-panel"));
+}
+
+function rememberNetworks(networks) {
+  networks.forEach((network) => {
+    const current = state.networkNames.get(network.id);
+    if (!current || network.version >= current.version) state.networkNames.set(network.id, network);
+  });
+  if (state.users.length) renderUsers();
+}
+
+async function loadNetworkMetadata(user) {
+  try {
+    const networks = expectArray(await apiRequest("/api/networks"), "网络资料");
+    if (state.user !== user) return;
+    rememberNetworks(networks); renderAuthorizedNetworks(user);
+  } catch (error) {
+    if (state.user !== user || error.name === "AbortError") return;
+    if (isSessionError(error)) { showLogin(); return; }
+    // 名称读取失败时保留 API 已授权的稳定标识，不猜测其他网络名称。
+    elements.networkList.append(textElement("p", "网络名称暂时读取失败，可刷新页面重试；授权标识如上所示。", "context-note"));
+  }
+}
+
 async function loadVpnStatus(user) {
   const panel = $("#vpn-integration-state");
+  panel.parentElement.classList.remove("applied");
   panel.textContent = "正在核对 VPN 接入状态…";
   try {
     const result = await apiRequest("/api/vpn/status");
     if (state.user !== user) return;
+    panel.parentElement.classList.toggle("applied", result.state === "applied");
     panel.textContent = result.state === "applied" ? "VPN 账户权限已同步；连接状态请以系统 VPN 设置为准。" : "VPN 账户权限尚未同步完成，请继续使用现有连接方式。";
   } catch (error) {
     if (state.user !== user || error.name === "AbortError") return;
@@ -121,13 +197,17 @@ async function loadVpnStatus(user) {
 }
 
 function showLogin() {
+  document.title = "登录 · VPN 管理器";
   // 会话切换必须使仍在飞行的旧账户读取结果过期，避免其覆盖新账户页面。
-  state.usersSerial += 1; state.ownDevicesSerial += 1; state.deviceSerial += 1; state.deviceAccountsSerial += 1; state.auditSerial += 1;
-  state.deviceAccounts = []; state.selectedDeviceAccount = null; state.auditCursors = [null]; state.auditIndex = 0;
+  state.usersSerial += 1; state.ownDevicesSerial += 1; state.deviceSerial += 1; state.deviceAccountsSerial += 1; state.auditSerial += 1; state.networksSerial += 1; state.userDialogSerial += 1;
+  state.users = []; state.deviceAccounts = []; state.selectedDeviceAccount = null; state.auditCursors = [null]; state.auditIndex = 0;
+  $("#user-search").value = ""; $("#user-status-filter").value = "all";
+  state.networks = []; state.networkNames.clear(); state.editingNetwork = null; $("#network-search").value = "";
   state.requestIds.forEach((controller) => controller.abort()); state.requestIds.clear();
   state.user = null; state.csrfToken = null; state.sessionToken = null;
   if (elements.userDialog.open) elements.userDialog.close();
   if (elements.deviceDialog.open) elements.deviceDialog.close();
+  if ($("#network-dialog").open) $("#network-dialog").close();
   elements.userForm.reset(); elements.deviceForm.reset();
   elements.appView.hidden = true; elements.loginView.hidden = false; elements.loginForm.reset(); clearError(elements.loginError); $("#username").focus();
 }
@@ -177,28 +257,202 @@ async function submitLogin(event) {
 function showPage(page) {
   if (page !== "overview" && state.user?.role !== "admin") return;
   document.querySelectorAll(".page").forEach((item) => { item.hidden = item.id !== `${page}-page`; });
-  document.querySelectorAll(".nav-item").forEach((item) => item.classList.toggle("active", item.dataset.page === page));
-  $("#main-content").focus();
+  document.querySelectorAll(".nav-item").forEach((item) => {
+    const current = item.dataset.page === page;
+    item.classList.toggle("active", current);
+    if (current) item.setAttribute("aria-current", "page"); else item.removeAttribute("aria-current");
+  });
+  const title = ({ overview: "访问概览", networks: "网络环境", users: "账户与授权", devices: "设备登记", audit: "登录审计" })[page];
+  $("#current-page-name").textContent = title;
+  document.title = `${title} · VPN 管理器`;
+  $("#main-content").focus({ preventScroll: true });
+  window.scrollTo({ top: 0, behavior: "instant" });
   if (page === "users") loadUsers(); if (page === "devices") loadDeviceAccounts(state.selectedDeviceAccount); if (page === "audit") loadAudit();
+  if (page === "networks") loadNetworks();
+}
+
+async function readNetworkCatalog() {
+  const user = state.user;
+  const networks = expectArray(await apiRequest("/api/admin/networks"), "网络目录");
+  if (state.user !== user) throw new DOMException("会话已切换", "AbortError");
+  state.networks = networks; rememberNetworks(networks);
+  return networks;
+}
+
+async function loadNetworks() {
+  const serial = ++state.networksSerial;
+  $("#networks-content").hidden = true; $("#network-search").disabled = true;
+  $("#networks-total").textContent = "—"; $("#networks-result-count").textContent = "";
+  setPanel($("#networks-state"), "", "正在读取网络目录…");
+  try {
+    await readNetworkCatalog();
+    if (serial !== state.networksSerial) return;
+    renderNetworks(); $("#networks-state").hidden = true; $("#networks-content").hidden = false; $("#network-search").disabled = false;
+    if (state.user) renderAuthorizedNetworks(state.user);
+  } catch (error) {
+    if (serial !== state.networksSerial || error.name === "AbortError") return;
+    if (isSessionError(error)) { showLogin(); return; }
+    setPanel($("#networks-state"), "error", `无法读取网络目录：${humanError(error)} 请点击右上角刷新重试。`);
+  }
+}
+
+function renderNetworks() {
+  const query = $("#network-search").value.trim().toLocaleLowerCase();
+  const networks = state.networks.filter((network) => `${network.name} ${network.description}`.toLocaleLowerCase().includes(query));
+  const body = $("#networks-body"); body.replaceChildren();
+  $("#networks-total").textContent = String(state.networks.length);
+  $("#networks-result-count").textContent = `显示 ${networks.length} / ${state.networks.length} 个网络`;
+  if (networks.length === 0) emptyRow(body, 4, query ? "没有匹配的网络" : "暂无网络", query ? "试试其他名称或说明。" : "通过右上角新增网络草稿。");
+  networks.forEach((network) => {
+    const row = document.createElement("tr");
+    const identity = document.createElement("td");
+    identity.append(textElement("strong", network.name, "network-name"), textElement("span", network.description || "暂无说明", "network-description"));
+    const status = document.createElement("td"); status.append(statusBadge(network.state === "draft" ? "草稿 · 待接通" : "现有网络", network.state === "draft" ? "inactive" : "active"));
+    const date = new Date(network.updated_at);
+    const updated = textElement("td", Number.isNaN(date.valueOf()) ? "—" : date.toLocaleString("zh-CN", { hour12: false }), "network-updated");
+    const actions = textElement("td", "", "table-actions"); const edit = textElement("button", "编辑", "link-button"); edit.type = "button";
+    edit.setAttribute("aria-label", `编辑网络 ${network.name}`); edit.addEventListener("click", () => openNetworkDialog(network)); actions.append(edit);
+    row.append(identity, status, updated, actions); body.append(row);
+  });
+}
+
+function openNetworkDialog(network = null) {
+  state.editingNetwork = network;
+  $("#network-form").reset(); clearError($("#network-form-error"));
+  $("#network-dialog-title").textContent = network ? "编辑网络资料" : "新增网络";
+  $("#network-name").value = network?.name || ""; $("#network-description").value = network?.description || "";
+  $("#network-form-note").textContent = network ? "名称与说明修改后会同步显示在授权页面，不改变现有 VPN 或账户权限。" : "新增网络先保存为草稿，不改变现有 VPN 或账户权限。";
+  const save = $("#save-network"); save.dataset.label = network ? "保存修改" : "保存草稿"; save.textContent = save.dataset.label; save.disabled = false;
+  $("#network-dialog").showModal(); $("#network-name").focus();
+}
+
+async function submitNetwork(event) {
+  event.preventDefault(); clearError($("#network-form-error"));
+  if (!$("#network-form").reportValidity()) return;
+  const name = $("#network-name").value.trim();
+  if (!name) { showError($("#network-form-error"), "请输入网络名称。"); return; }
+  const network = state.editingNetwork;
+  const payload = { name, description: $("#network-description").value.trim() };
+  if (network) payload.version = network.version;
+  setBusy($("#save-network"), true, "正在保存…");
+  try {
+    const saved = await apiRequest(network ? `/api/admin/networks/${encodeURIComponent(network.id)}` : "/api/admin/networks", { method: network ? "PATCH" : "POST", body: payload, mutation: true });
+    rememberNetworks([saved]); $("#network-dialog").close();
+    showNotice(network ? "网络资料已更新，原有权限保持不变。" : "网络草稿已保存，完成接通验证后才能授权。");
+    await loadNetworks();
+  } catch (error) {
+    if (isSessionError(error)) { showLogin(); return; }
+    if (error.name !== "AbortError") showError($("#network-form-error"), humanError(error));
+  } finally { setBusy($("#save-network"), false, ""); }
 }
 
 async function loadUsers() {
   elements.usersContent.hidden = true; setPanel(elements.usersState, "", "正在读取账户列表…");
+  state.users = [];
+  $("#users-total").textContent = "—";
+  $("#users-summary").textContent = "";
+  $("#users-result-count").textContent = "";
+  $("#user-search").disabled = true;
+  $("#user-status-filter").disabled = true;
   const serial = ++state.usersSerial;
-  try { const users = expectArray(await apiRequest("/api/admin/users"), "账户列表"); if (serial !== state.usersSerial) return; renderUsers(users); elements.usersState.hidden = true; elements.usersContent.hidden = false; }
+  try {
+    const users = expectArray(await apiRequest("/api/admin/users"), "账户列表");
+    if (serial !== state.usersSerial) return;
+    state.users = users;
+    $("#user-search").disabled = false;
+    $("#user-status-filter").disabled = false;
+    renderUsers();
+    elements.usersState.hidden = true; elements.usersContent.hidden = false;
+  }
   catch (error) { if (serial === state.usersSerial && error.name !== "AbortError") { if (isSessionError(error)) return showLogin(); setPanel(elements.usersState, "error", `无法读取账户列表：${humanError(error)}`); } }
 }
-function renderUsers(users) {
+function renderUsers() {
+  const query = $("#user-search").value.trim().toLowerCase();
+  const filter = $("#user-status-filter").value;
+  const users = state.users.filter((user) => user.username.toLowerCase().includes(query) && (filter === "all" || user.active === (filter === "active")));
+  $("#users-total").textContent = state.users.length;
+  $("#users-summary").textContent = `启用 ${state.users.filter((user) => user.active).length} · 管理员 ${state.users.filter((user) => user.role === "admin").length}`;
+  $("#users-result-count").textContent = `显示 ${users.length} 个账户，共 ${state.users.length} 个`;
   elements.usersBody.replaceChildren();
-  if (!Array.isArray(users) || users.length === 0) { const row = document.createElement("tr"); const cell = document.createElement("td"); cell.colSpan = 5; cell.textContent = "没有账户记录。"; row.append(cell); elements.usersBody.append(row); return; }
-  users.forEach((user) => { const row = document.createElement("tr"); const cells = [user.username, roleText(user.role), user.networks.map(networkText).join("、")]; cells.forEach((value) => { const cell = document.createElement("td"); cell.textContent = value; row.append(cell); }); const status = document.createElement("td"); status.append(statusBadge(user.active ? "启用" : "已停用", user.active ? "active" : "inactive")); row.append(status); const actions = document.createElement("td"); actions.className = "table-actions"; const devices = document.createElement("button"); devices.className = "link-button"; devices.type = "button"; devices.textContent = "设备"; devices.addEventListener("click", () => openDevicesFor(user.username)); actions.append(devices); const edit = document.createElement("button"); edit.className = "link-button"; edit.type = "button"; edit.textContent = "编辑"; edit.addEventListener("click", () => openUserDialog(user)); actions.append(edit); if (user.active) { const disable = document.createElement("button"); disable.className = "link-button"; disable.type = "button"; disable.textContent = "停用"; disable.addEventListener("click", () => deactivateUser(user, disable)); actions.append(disable); } row.append(actions); elements.usersBody.append(row); });
+  if (users.length === 0) {
+    emptyRow(elements.usersBody, 5, state.users.length ? "没有匹配的账户" : "暂无账户记录", state.users.length ? "试试其他账户名，或切换账户状态。" : "新建账户后，可为其分配角色与网络权限。");
+    return;
+  }
+  users.forEach((user) => {
+    const row = document.createElement("tr");
+    const identity = document.createElement("td");
+    const name = textElement("div", "", "account-cell");
+    const avatar = textElement("span", user.username.slice(0, 1).toUpperCase(), "avatar");
+    avatar.setAttribute("aria-hidden", "true");
+    name.append(avatar, document.createTextNode(user.username)); identity.append(name);
+    const role = document.createElement("td");
+    const roleLabel = textElement("span", "", `role-label ${user.role === "admin" ? "admin" : ""}`);
+    if (user.role === "admin") roleLabel.append(icon("shield"));
+    roleLabel.append(document.createTextNode(roleText(user.role, user.protected))); role.append(roleLabel);
+    const networks = document.createElement("td");
+    const tags = textElement("div", "", "permission-tags");
+    tags.append(...user.networks.map(networkTag)); networks.append(tags);
+    const status = document.createElement("td");
+    status.append(statusBadge(user.active ? "启用" : "已停用", user.active ? "active" : "inactive"));
+    const actions = textElement("td", "", "table-actions");
+    const edit = textElement("button", "编辑", "link-button");
+    edit.type = "button"; edit.setAttribute("aria-label", `编辑账户 ${user.username}`);
+    edit.addEventListener("click", () => openUserDialog(user));
+    const devices = textElement("button", "设备记录", "link-button");
+    devices.type = "button"; devices.setAttribute("aria-label", `查看 ${user.username} 的设备记录`);
+    devices.addEventListener("click", () => openDevicesFor(user.username));
+    const grant = textElement("button", "网络授权", "link-button");
+    grant.type = "button"; grant.setAttribute("aria-label", `修改 ${user.username} 的网络授权`);
+    grant.addEventListener("click", () => openUserDialog(user, true));
+    actions.append(edit, grant, devices);
+    if (user.active) {
+      const disable = textElement("button", "停用", "link-button danger");
+      disable.type = "button"; disable.setAttribute("aria-label", `停用账户 ${user.username}`);
+      disable.disabled = Boolean(user.protected);
+      if (user.protected) disable.title = "系统管理员不能停用";
+      disable.addEventListener("click", () => deactivateUser(user, disable)); actions.append(disable);
+    }
+    row.append(identity, role, networks, status, actions); elements.usersBody.append(row);
+  });
 }
 
-function openUserDialog(user = null) {
-  elements.userForm.reset(); clearError(elements.userFormError); elements.editingUsername.value = user?.username || ""; elements.managedUsername.disabled = Boolean(user); elements.managedUsername.value = user?.username || ""; elements.managedPassword.required = !user; elements.passwordHint.textContent = user ? "（留空则不修改）" : "（至少 10 位）"; elements.userDialogTitle.textContent = user ? `编辑账户：${user.username}` : "新建账户"; elements.saveUser.dataset.label = user ? "保存修改" : "创建账户"; elements.saveUser.textContent = elements.saveUser.dataset.label; if (user) { document.querySelector(`input[name="managed-role"][value="${user.role}"]`).checked = true; $("#network-home").checked = user.networks.includes("home"); $("#network-work").checked = user.networks.includes("work"); }
-  elements.userDialog.showModal(); elements.managedUsername.focus();
+async function openUserDialog(user = null, focusNetworks = false) {
+  const serial = ++state.userDialogSerial;
+  elements.userForm.reset(); clearError(elements.userFormError);
+  elements.editingUsername.value = user?.username || ""; elements.managedUsername.disabled = Boolean(user); elements.managedUsername.value = user?.username || "";
+  elements.managedPassword.required = !user; elements.passwordHint.textContent = user ? "（留空则不修改）" : "（至少 10 位）";
+  elements.userDialogTitle.textContent = user ? `编辑账户：${user.username}` : "新建账户";
+  elements.saveUser.dataset.label = user ? "保存修改" : "创建账户"; elements.saveUser.textContent = elements.saveUser.dataset.label;
+  if (user) document.querySelector(`input[name="managed-role"][value="${user.role}"]`).checked = true;
+  document.querySelectorAll("input[name='managed-role']").forEach((input) => { input.disabled = Boolean(user?.protected); });
+  $("#protected-account-note").hidden = !user?.protected;
+  $("#network-choices").replaceChildren(textElement("p", "正在读取可授权网络…", "muted")); elements.saveUser.disabled = true;
+  elements.userDialog.showModal();
+  (user ? elements.managedPassword : elements.managedUsername).focus();
+  try {
+    const networks = await readNetworkCatalog();
+    if (!elements.userDialog.open || serial !== state.userDialogSerial) return;
+    $("#network-choices").replaceChildren(...networks.filter((network) => network.state === "existing").map((network) => {
+      const label = textElement("label", "", "choice"); const input = document.createElement("input"); input.type = "checkbox"; input.value = network.id;
+      input.checked = user?.networks.includes(network.id) || false;
+      label.append(input, icon(networkIcon(network.id)), textElement("span", network.name)); return label;
+    }));
+    syncNetworkChoices(); elements.saveUser.disabled = false;
+    if (focusNetworks) $("#network-choices input:not(:disabled)")?.focus();
+  } catch (error) {
+    if (isSessionError(error)) { showLogin(); return; }
+    if (serial === state.userDialogSerial && error.name !== "AbortError" && elements.userDialog.open) showError(elements.userFormError, `无法读取可授权网络，请关闭后重试：${humanError(error)}`);
+  }
 }
-function selectedNetworks() { return ["home", "work"].filter((network) => $(`#network-${network}`).checked); }
+function syncNetworkChoices() {
+  const member = document.querySelector("input[name='managed-role']:checked").value === "user";
+  $("#network-choices").querySelectorAll("input").forEach((input) => {
+    input.disabled = member;
+    if (member) input.checked = input.value === "work";
+  });
+  $("#network-choices-hint").textContent = member ? `普通用户仅可授权「${networkText("work")}」；草稿不能授权。` : "仅分配该账户需要访问的网络，草稿不能授权。";
+}
+function selectedNetworks() { return [...$("#network-choices").querySelectorAll("input:checked")].map((input) => input.value); }
 async function submitUser(event) {
   event.preventDefault(); clearError(elements.userFormError); const isEdit = Boolean(elements.editingUsername.value); const networks = selectedNetworks();
   if (!elements.userForm.reportValidity()) return; if (networks.length === 0) { showError(elements.userFormError, "至少选择一个授权网络。"); return; }
@@ -210,6 +464,7 @@ async function submitUser(event) {
   catch (error) { showError(elements.userFormError, humanError(error)); } finally { setBusy(elements.saveUser, false, ""); }
 }
 async function deactivateUser(user, button) {
+  if (user.protected) return;
   if (!window.confirm(`确定停用账户“${user.username}”吗？该操作将撤销其会话。`)) return;
   setBusy(button, true, "停用中…");
   try { await apiRequest(`/api/admin/users/${encodeURIComponent(user.username)}/deactivate`, { method: "POST", body: {}, mutation: true }); showNotice("账户已停用。"); await loadUsers(); }
@@ -237,7 +492,7 @@ async function loadOwnDevices() {
 }
 function renderOwnDevices(devices) {
   elements.ownDevicesBody.replaceChildren();
-  if (devices.length === 0) { const row = document.createElement("tr"); const cell = document.createElement("td"); cell.colSpan = 3; cell.textContent = "没有设备登记记录。请联系管理员维护名单。"; row.append(cell); elements.ownDevicesBody.append(row); return; }
+  if (devices.length === 0) { emptyRow(elements.ownDevicesBody, 3, "还没有设备记录", "需要登记时，请联系管理员维护名单。"); return; }
   devices.forEach((device) => { const row = document.createElement("tr"); const id = document.createElement("td"); id.textContent = device.device_id; row.append(id); const stateCell = document.createElement("td"); stateCell.append(statusBadge(deviceStateText(device.state), device.state === "registered" ? "active" : "inactive")); row.append(stateCell); const updated = document.createElement("td"); updated.textContent = deviceTime(device.updated_at); row.append(updated); elements.ownDevicesBody.append(row); });
 }
 
@@ -282,10 +537,10 @@ function renderDevices(devices, account) {
   elements.devicesBody.replaceChildren();
   const limitReached = deviceLimitReached(devices);
   const registeredCount = devices.filter((device) => device.state === "registered").length;
-  elements.deviceLimit.textContent = `已登记设备记录：${registeredCount}/10。已移除记录不计入上限。设备名单不构成账户密码登录或 VPN 准入控制。`;
+  elements.deviceLimit.textContent = `${registeredCount} / 10`;
   elements.openAddDevice.disabled = limitReached;
   elements.openAddDevice.title = limitReached ? "该账户已达到 10 条已登记设备记录上限。" : "";
-  if (devices.length === 0) { const row = document.createElement("tr"); const cell = document.createElement("td"); cell.colSpan = 4; cell.textContent = "没有设备登记记录。"; row.append(cell); elements.devicesBody.append(row); }
+  if (devices.length === 0) emptyRow(elements.devicesBody, 4, "这个账户还没有设备记录", "点击“登记设备”，添加便于管理的设备标识。");
   devices.forEach((device) => { const row = document.createElement("tr"); const id = document.createElement("td"); id.textContent = device.device_id; row.append(id); const stateCell = document.createElement("td"); stateCell.append(statusBadge(deviceStateText(device.state), device.state === "registered" ? "active" : "inactive")); row.append(stateCell); const updated = document.createElement("td"); updated.textContent = deviceTime(device.updated_at); row.append(updated); const actions = document.createElement("td"); actions.className = "table-actions"; if (device.state === "registered") { const remove = document.createElement("button"); remove.className = "link-button"; remove.type = "button"; remove.textContent = "移除记录"; remove.addEventListener("click", () => removeDevice(account, device, remove)); actions.append(remove); } else { actions.textContent = "—"; } row.append(actions); elements.devicesBody.append(row); });
 }
 function openDeviceDialog() {
@@ -321,8 +576,24 @@ async function loadAudit() {
 }
 function renderAudit(page) {
   elements.auditBody.replaceChildren(); const items = Array.isArray(page?.items) ? page.items : [];
-  if (items.length === 0) { const row = document.createElement("tr"); const cell = document.createElement("td"); cell.colSpan = 5; cell.textContent = "没有符合条件的审计记录。"; row.append(cell); elements.auditBody.append(row); }
-  items.forEach((item) => { const row = document.createElement("tr"); const date = new Date(item.occurred_at); const values = [Number.isNaN(date.valueOf()) ? item.occurred_at : date.toLocaleString("zh-CN", { hour12: false }), item.actor || "—", item.action]; values.forEach((value) => { const cell = document.createElement("td"); cell.textContent = value; row.append(cell); }); const outcomeCell = document.createElement("td"); const outcomeText = item.outcome === "success" ? "成功" : item.outcome === "failure" ? "失败" : "拒绝"; outcomeCell.append(statusBadge(outcomeText, item.outcome)); row.append(outcomeCell); const sourceCell = document.createElement("td"); sourceCell.textContent = item.source_ip || "—"; row.append(sourceCell); elements.auditBody.append(row); });
+  if (items.length === 0) emptyRow(elements.auditBody, 5, "暂无审计记录", "登录和管理操作的记录会显示在这里。");
+  // 保留服务端动作值作为提示，未知动作仍显示原值，避免丢失审计含义。
+  const actionLabels = { login: "账户登录", logout: "退出登录", login_rate_limited: "登录频率限制", admin_access: "管理操作鉴权", user_create: "创建账户", user_update: "更新账户", user_deactivate: "停用账户", device_record_add: "登记设备", device_record_remove: "移除设备记录", gateway_sync_queued: "权限同步排队", gateway_sync_retry: "重试权限同步", gateway_sync_applied: "权限同步完成", gateway_sync_failed: "权限同步失败", authentication_schema_upgrade: "认证数据升级", gateway_schema_upgrade: "网关数据升级", user_network_policy_upgrade: "网络授权规则升级", network_catalog_upgrade: "网络目录升级", network_create: "新增网络草稿", network_update: "修改网络资料" };
+  items.forEach((item) => {
+    const row = document.createElement("tr");
+    const date = new Date(item.occurred_at);
+    const time = textElement("td", Number.isNaN(date.valueOf()) ? item.occurred_at : date.toLocaleString("zh-CN", { hour12: false }));
+    const actor = textElement("td", item.actor || "—");
+    const action = textElement("td", actionLabels[item.action] || item.action);
+    action.title = item.action;
+    if (item.target && item.target !== item.actor) action.append(textElement("small", item.target, "audit-target"));
+    const outcome = document.createElement("td");
+    const outcomeText = item.outcome === "success" ? "成功" : item.outcome === "failure" ? "失败" : "拒绝";
+    outcome.append(statusBadge(outcomeText, item.outcome));
+    row.append(time, actor, action, outcome, textElement("td", item.source_ip || "—"));
+    elements.auditBody.append(row);
+  });
+  $("#audit-result-count").textContent = `本页 ${items.length} 条记录`;
   const next = page?.next_cursor ?? null; if (next !== null) state.auditCursors[state.auditIndex + 1] = next; else state.auditCursors.length = state.auditIndex + 1;
   elements.auditPrev.disabled = state.auditIndex === 0; elements.auditNext.disabled = next === null; elements.auditPageLabel.textContent = `第 ${state.auditIndex + 1} 页`;
 }
@@ -339,6 +610,31 @@ async function logout() {
   } finally { setBusy(elements.logout, false, ""); }
 }
 
-elements.loginForm.addEventListener("submit", submitLogin); elements.logout.addEventListener("click", logout); document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("click", () => showPage(item.dataset.page))); $("#open-create-user").addEventListener("click", () => openUserDialog()); $("#close-user-dialog").addEventListener("click", () => elements.userDialog.close()); $("#cancel-user").addEventListener("click", () => elements.userDialog.close()); elements.userForm.addEventListener("submit", submitUser); elements.openAddDevice.addEventListener("click", openDeviceDialog); $("#close-device-dialog").addEventListener("click", () => elements.deviceDialog.close()); $("#cancel-device").addEventListener("click", () => elements.deviceDialog.close()); elements.deviceForm.addEventListener("submit", submitDeviceRegistration); elements.deviceAccountSelect.addEventListener("change", () => { state.selectedDeviceAccount = elements.deviceAccountSelect.value; loadDevices(); }); elements.auditPrev.addEventListener("click", () => { if (state.auditIndex > 0) { state.auditIndex -= 1; loadAudit(); } }); elements.auditNext.addEventListener("click", () => { if (state.auditCursors[state.auditIndex + 1] != null) { state.auditIndex += 1; loadAudit(); } });
+elements.loginForm.addEventListener("submit", submitLogin);
+elements.logout.addEventListener("click", logout);
+document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("click", () => showPage(item.dataset.page)));
+$("#user-search").addEventListener("input", renderUsers);
+$("#user-status-filter").addEventListener("change", renderUsers);
+$("#refresh-users").addEventListener("click", loadUsers);
+$("#refresh-networks").addEventListener("click", loadNetworks);
+$("#network-search").addEventListener("input", renderNetworks);
+$("#open-create-network").addEventListener("click", () => openNetworkDialog());
+$("#close-network-dialog").addEventListener("click", () => $("#network-dialog").close());
+$("#cancel-network").addEventListener("click", () => $("#network-dialog").close());
+$("#network-form").addEventListener("submit", submitNetwork);
+document.querySelectorAll("input[name='managed-role']").forEach((input) => input.addEventListener("change", syncNetworkChoices));
+$("#refresh-audit").addEventListener("click", () => { state.auditCursors = [null]; state.auditIndex = 0; loadAudit(); });
+$("#open-create-user").addEventListener("click", () => openUserDialog());
+$("#close-user-dialog").addEventListener("click", () => elements.userDialog.close());
+$("#cancel-user").addEventListener("click", () => elements.userDialog.close());
+elements.userDialog.addEventListener("close", () => { state.userDialogSerial += 1; });
+elements.userForm.addEventListener("submit", submitUser);
+elements.openAddDevice.addEventListener("click", openDeviceDialog);
+$("#close-device-dialog").addEventListener("click", () => elements.deviceDialog.close());
+$("#cancel-device").addEventListener("click", () => elements.deviceDialog.close());
+elements.deviceForm.addEventListener("submit", submitDeviceRegistration);
+elements.deviceAccountSelect.addEventListener("change", () => { state.selectedDeviceAccount = elements.deviceAccountSelect.value; loadDevices(); });
+elements.auditPrev.addEventListener("click", () => { if (state.auditIndex > 0) { state.auditIndex -= 1; loadAudit(); } });
+elements.auditNext.addEventListener("click", () => { if (state.auditCursors[state.auditIndex + 1] != null) { state.auditIndex += 1; loadAudit(); } });
 
 if (await loadConfig()) await restoreSession();
