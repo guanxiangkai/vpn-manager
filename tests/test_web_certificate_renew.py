@@ -25,9 +25,11 @@ def test_certbot_command_is_named_and_not_global(monkeypatch, tmp_path):
     assert "--authenticator" in command and "standalone" in command
     assert "--http-01-port" in command and "80" in command
     assert "--no-directory-hooks" in command
+    assert "--no-random-sleep-on-renew" in command
     assert "--ip-address" not in command
     assert "--all" not in command
     assert kwargs["check"] is True and kwargs.get("shell") is not True
+    assert kwargs["timeout"] == 180
 
 
 def test_certbot_uses_installed_executable_and_exact_probe_address(monkeypatch, tmp_path):

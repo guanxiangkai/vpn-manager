@@ -39,6 +39,7 @@ def _assert_port_free(bind: str, port: int) -> None:
 def _run_certbot(cert_name: str, address: str, certbot_root: Path, *, bind: str = "127.0.0.1",
                  certbot: str = CERTBOT, dry_run: bool = False) -> None:
     command = [certbot, "renew", "--cert-name", cert_name, "--non-interactive",
+               "--no-random-sleep-on-renew",
                "--authenticator", "standalone", "--preferred-challenges", "http-01",
                "--http-01-port", "80", "--http-01-address", bind,
                "--no-directory-hooks", "--config-dir", str(certbot_root),
@@ -46,6 +47,7 @@ def _run_certbot(cert_name: str, address: str, certbot_root: Path, *, bind: str 
     # IP SAN 与 cert-name 都来自受控 unit 参数；不拼接 shell 命令。
     if dry_run:
         command.append("--dry-run")
+    # systemd timer 已负责随机错峰；避免 Certbot 再次等待并超过单次执行保护时限。
     # renew 沿用指定证书的续期配置，不重新提交 --ip-address 申请参数。
     subprocess.run(command, check=True, capture_output=True,
                    text=True, timeout=180)
