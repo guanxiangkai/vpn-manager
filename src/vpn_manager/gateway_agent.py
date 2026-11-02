@@ -87,8 +87,12 @@ def nt_credential(password: str) -> str:
 
 
 def check_request(request: object) -> dict[str, Any]:
-    if not isinstance(request, dict) or request.get("action") not in {"status", "apply_account"}:
+    if not isinstance(request, dict) or request.get("action") not in {"status", "apply_account", "reload_certificate"}:
         raise ProjectionError("invalid_request")
+    if request["action"] == "reload_certificate":
+        if set(request) != {"action"}:
+            raise ProjectionError("invalid_request")
+        return request
     username = request.get("username")
     if not isinstance(username, str) or re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", username) is None:
         raise ProjectionError("invalid_request")
@@ -309,6 +313,15 @@ class GatewayAgent:
 
     def apply(self, request: dict[str, Any]) -> dict[str, Any]:
         request = check_request(request)
+        if request["action"] == "reload_certificate":
+            # 与权限变更在同一个串行控制循环执行，避免续期重新加载旧授权。
+            # 只更新已生效的活动连接模板，不断开现有 SA，也不恢复被隔离的账户。
+            count = 0
+            for username, account in self.state["accounts"].items():
+                if account["active"] and account["state"] == "applied":
+                    self.driver.load(username, account)
+                    count += 1
+            return {"state": "certificate_reloaded", "accounts": count}
         username = request["username"]
         if request["action"] == "status":
             return self.status(username)

@@ -80,6 +80,24 @@ def test_gateway_agent_rejects_malformed_requests(payload):
         gateway_agent.check_request(payload)
 
 
+def test_certificate_reload_preserves_sessions_and_excludes_inactive_accounts(agent):
+    """续期不会撤销 SA、修改防火墙或恢复停用账户。"""
+    gateway, _driver, events = agent
+    gateway.apply(request())
+    gateway.state["accounts"]["disabled"] = {"active": False, "state": "applied"}
+    gateway.state["accounts"]["pending"] = {"active": True, "state": "pending"}
+    events.clear()
+    assert gateway.apply({"action": "reload_certificate"}) == {"state": "certificate_reloaded", "accounts": 1}
+    assert events == [("load", "adminone", ("home",))]
+
+
+@pytest.mark.parametrize("extra", [{"username": "adminone"}, {"certificate": "/tmp/foreign.pem"}])
+def test_certificate_reload_cannot_select_identity_or_certificate(extra):
+    """控制端无法通过续期接口指定其他证书或任意身份。"""
+    with pytest.raises(gateway_agent.ProjectionError, match="invalid_request"):
+        gateway_agent.check_request({"action": "reload_certificate", **extra})
+
+
 def test_same_generation_is_idempotent_and_conflicting_payload_is_rejected(agent):
     """相同 operation 的已应用重投不触发系统操作；同版本不同内容拒绝。"""
     gateway, _driver, events = agent
