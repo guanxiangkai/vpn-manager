@@ -6,6 +6,7 @@ from ipaddress import ip_address
 import os
 from pathlib import Path
 import stat
+import struct
 
 import uvicorn
 from cryptography.hazmat.primitives import serialization
@@ -13,6 +14,45 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
 
 from .app import create_app
 from .gateway_sync import GatewayClient
+
+
+def _is_private_service_credential(info: os.stat_result, descriptor: int) -> bool:
+    """仅兼容 systemd 给当前服务用户增加只读 ACL 的凭据文件。"""
+    if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o440 or os.geteuid() == 0:
+        return False
+    # Linux POSIX ACL 的组权限位表示 ACL mask，不能据此认定整个组可读。
+    # 只接受这一组完整条目：root 和当前 UID 只读，属组及其他用户无权限。
+    undefined_id = 0xFFFFFFFF
+    entries = ((1, 4, undefined_id), (2, 4, os.geteuid()),
+               (4, 0, undefined_id), (16, 4, undefined_id), (32, 0, undefined_id))
+    expected = struct.pack("<I", 2) + b"".join(struct.pack("<HHI", *entry) for entry in entries)
+    try:
+        return os.getxattr(descriptor, "system.posix_acl_access") == expected
+    except (AttributeError, OSError):
+        return False
+
+
+def _validate_tls_private_key(path: Path) -> None:
+    """通过已打开的文件核对权限；拒绝链接、非普通文件及额外读者。"""
+    try:
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError("TLS 私钥文件权限或属主不安全")
+        flags = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                 | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        descriptor = os.open(path, flags)
+        try:
+            info = os.fstat(descriptor)
+            identity = lambda value: (value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid)
+            if not stat.S_ISREG(info.st_mode) or identity(before) != identity(info):
+                raise RuntimeError("TLS 私钥文件权限或属主不安全")
+            private_mode = not info.st_mode & 0o077 and info.st_uid in {0, os.geteuid()}
+            if not private_mode and not _is_private_service_credential(info, descriptor):
+                raise RuntimeError("TLS 私钥文件权限或属主不安全")
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise RuntimeError("无法安全读取 TLS 私钥文件") from error
 
 
 def _load_gateway_public_key(value: str) -> bytes:
@@ -85,9 +125,10 @@ def main() -> None:
     if not 1024 <= args.port <= 65535:
         parser.error("端口必须在 1024–65535 之间")
     # TLS 私钥必须在 Linux 主机受控保存，不能放进仓库或输出目录。
-    info = args.key.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_uid not in {0,os.geteuid()}:
-        parser.error("TLS 私钥文件权限或属主不安全")
+    try:
+        _validate_tls_private_key(args.key)
+    except RuntimeError as error:
+        parser.error(str(error))
     if not args.cert.is_file():
         parser.error("HTTPS 服务证书不存在")
     uvicorn.run("vpn_manager.runtime:application",factory=True,host=str(address),port=args.port,
