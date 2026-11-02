@@ -180,6 +180,24 @@ def test_runtime_gateway_configuration_requires_pair_and_loads_safe_x25519_key(t
         runtime.application()
 
 
+def test_runtime_require_gateway_is_strict_and_requires_complete_configuration(tmp_path, monkeypatch):
+    database = tmp_path / "manager.sqlite3"
+    Store(database).initialize()
+    monkeypatch.setenv("VPN_MANAGER_DB", str(database))
+    monkeypatch.setenv("VPN_MANAGER_ORIGIN", "https://slimjoy.cn")
+    monkeypatch.delenv("VPN_MANAGER_GATEWAY_PUBLIC_KEY", raising=False)
+    monkeypatch.delenv("VPN_MANAGER_GATEWAY_SOCKET", raising=False)
+    monkeypatch.setenv("VPN_MANAGER_REQUIRE_GATEWAY", "not-true")
+    with pytest.raises(RuntimeError, match="必须为 true 或 false"):
+        runtime.application()
+    monkeypatch.setenv("VPN_MANAGER_REQUIRE_GATEWAY", "true")
+    with pytest.raises(RuntimeError, match="生产保护模式要求"):
+        runtime.application()
+    monkeypatch.setenv("VPN_MANAGER_REQUIRE_GATEWAY", "false")
+    monkeypatch.setattr(runtime, "create_app", lambda *args, **kwargs: object())
+    assert runtime.application() is not None
+
+
 def test_gateway_client_rejects_malformed_or_oversized_reply(tmp_path):
     path = str(tmp_path / "gateway.sock")
     ready = threading.Event()

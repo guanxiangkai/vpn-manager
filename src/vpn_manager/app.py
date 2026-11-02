@@ -7,7 +7,7 @@ from threading import BoundedSemaphore
 from typing import Annotated, Any
 from urllib.parse import urlsplit
 
-from fastapi import Cookie, Depends, FastAPI, Header, Query, Request, Response
+from fastapi import Depends, FastAPI, Header, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -95,17 +95,19 @@ class RequestBoundaryMiddleware:
         await self.app(scope,replay,secured_send)
 
 
-def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_origin: str = ALLOWED_ORIGIN, web_directory: str | Path | None = None, gateway_public_key: bytes | None = None, gateway_client: GatewayClient | None = None) -> FastAPI:
+def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_origin: str = ALLOWED_ORIGIN, web_directory: str | Path | None = None, gateway_public_key: bytes | None = None, gateway_client: GatewayClient | None = None, session_transport: str = "cookie") -> FastAPI:
     origin = urlsplit(allowed_origin)
     if origin.scheme!="https" or not origin.hostname or origin.username or origin.password or origin.path or origin.query or origin.fragment:
         raise ValueError("管理入口必须是无路径的 HTTPS 来源")
     _ = origin.port
+    if session_transport not in {"cookie", "bearer"}:
+        raise ValueError("会话传输方式必须为 cookie 或 bearer")
     store = Store(database_path)
     store.initialize()
     app = FastAPI(title="VPN 管理器",docs_url=None,redoc_url=None,openapi_url=None)
     app.state.store, app.state.allowed_origin = store, allowed_origin
     app.state.gateway_public_key, app.state.gateway_client = gateway_public_key, gateway_client
-    app.add_middleware(CORSMiddleware,allow_origins=[allowed_origin],allow_credentials=True,allow_methods=["GET","POST","PATCH","OPTIONS"],allow_headers=["Content-Type","X-CSRF-Token"],max_age=600)
+    app.add_middleware(CORSMiddleware,allow_origins=[allowed_origin],allow_credentials=session_transport == "cookie",allow_methods=["GET","POST","PATCH","OPTIONS"],allow_headers=["Content-Type","X-CSRF-Token","Authorization"],max_age=600)
     app.add_middleware(RequestBoundaryMiddleware)
     password_slots = BoundedSemaphore(2)
     dummy_hash = hash_password(new_secret())
@@ -160,14 +162,28 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
                 "applied_generation": applied_generation, "state": state, "code": code,
                 "updated_at": None}
 
-    def current_user(session_token: Annotated[str | None,Cookie(alias=COOKIE_NAME)] = None):
+    def request_session(request: Request) -> str | None:
+        """显式选择一种认证方式，禁止在 Cookie 与请求头之间悄悄回退。"""
+        authorization = request.headers.getlist("authorization")
+        if session_transport == "cookie":
+            return None if authorization else request.cookies.get(COOKIE_NAME)
+        if len(authorization) != 1 or request.cookies.get(COOKIE_NAME):
+            return None
+        scheme, separator, token = authorization[0].partition(" ")
+        if scheme.lower() != "bearer" or not separator or len(token) != 43 or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-" for c in token):
+            return None
+        return token
+
+    def current_user(request: Request):
+        session_token = request_session(request)
         user = store.session_user(session_token) if session_token else None
         if user is None:
             raise ApiError(401,"authentication_required","请先登录。")
         return user
 
-    def csrf_protected(request: Request,user: Annotated[dict,Depends(current_user)],session_token: Annotated[str | None,Cookie(alias=COOKIE_NAME)] = None,csrf_token: Annotated[str | None,Header(alias="X-CSRF-Token")] = None):
+    def csrf_protected(request: Request,user: Annotated[dict,Depends(current_user)],csrf_token: Annotated[str | None,Header(alias="X-CSRF-Token")] = None):
         require_origin(request)
+        session_token = request_session(request)
         if not session_token or not csrf_token or not store.csrf_valid(session_token,csrf_token):
             raise ApiError(403,"csrf_invalid","CSRF 校验失败，请刷新页面后重试。")
         return user
@@ -184,7 +200,7 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
 
     def authorize_write(connection, request: Request, *, admin: bool = False):
         # 与写入共用事务，防止依赖检查之后的撤权被正在处理的请求绕过。
-        token = request.cookies.get(COOKIE_NAME)
+        token = request_session(request)
         user = store.session_user_in_transaction(connection, token) if token else None
         if user is None:
             raise ApiError(401, "authentication_required", "请重新登录。")
@@ -199,7 +215,7 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
     def health():
         return {"message":"ok"}
 
-    @app.post("/api/auth/login",response_model=LoginResponse)
+    @app.post("/api/auth/login",response_model=LoginResponse,response_model_exclude_none=True)
     def login(payload: LoginRequest,request: Request,response: Response):
         require_origin(request)
         now, address = utc_now(), source_ip(request)
@@ -242,28 +258,35 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
                 store.audit(connection,actor=payload.username,source_ip=address,action="login",target=payload.username,outcome="success")
         if not accepted:
             raise ApiError(401,"invalid_credentials","账户或密码错误。")
-        response.set_cookie(COOKIE_NAME,token,max_age=int(SESSION_TTL.total_seconds()),httponly=True,secure=True,samesite="lax",path="/")
-        return {"user":public_user(user),"csrf_token":csrf_token}
+        result = {"user":public_user(user),"csrf_token":csrf_token}
+        if session_transport == "cookie":
+            response.set_cookie(COOKIE_NAME,token,max_age=int(SESSION_TTL.total_seconds()),httponly=True,secure=True,samesite="lax",path="/")
+        else:
+            result["session_token"] = token
+        return result
 
     @app.get("/api/auth/me",response_model=UserView)
     def me(user: Annotated[dict,Depends(current_user)]):
         return public_user(user)
 
     @app.post("/api/auth/refresh",response_model=MeResponse)
-    def refresh(request: Request,user: Annotated[dict,Depends(current_user)],session_token: Annotated[str | None,Cookie(alias=COOKIE_NAME)] = None):
+    def refresh(request: Request,user: Annotated[dict,Depends(current_user)]):
         require_origin(request)
+        session_token = request_session(request)
         csrf_token = new_secret()
         if not store.rotate_csrf(session_token,csrf_token):
             raise ApiError(401,"authentication_required","请先登录。")
         return {**public_user(user),"csrf_token":csrf_token}
 
     @app.post("/api/auth/logout",response_model=MessageResponse)
-    def logout(request: Request,response: Response,user: Annotated[dict,Depends(csrf_protected)],session_token: Annotated[str | None,Cookie(alias=COOKIE_NAME)] = None):
+    def logout(request: Request,response: Response,user: Annotated[dict,Depends(csrf_protected)]):
+        session_token = request_session(request)
         with store.write_transaction() as connection:
             if not store.revoke_session_in_transaction(connection,session_token,user["username"]):
                 raise ApiError(401,"authentication_required","请先登录。")
             store.audit(connection,actor=user["username"],source_ip=source_ip(request),action="logout",target=user["username"],outcome="success")
-        response.delete_cookie(COOKIE_NAME,path="/",secure=True,httponly=True,samesite="lax")
+        if session_transport == "cookie":
+            response.delete_cookie(COOKIE_NAME,path="/",secure=True,httponly=True,samesite="lax")
         return {"message":"已退出登录"}
 
     @app.get("/api/devices",response_model=list[DeviceView])

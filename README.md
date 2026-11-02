@@ -7,12 +7,12 @@
 ## 已实现边界
 
 - 管理网页登录使用 Argon2id 密码哈希；角色为 `admin` 或 `user`。普通用户只能获得 `work`；管理员可被授予 `home`、`work`。
-- 管理会话为随机的 HttpOnly、Secure、SameSite=Lax Cookie；登录和 `POST /api/auth/refresh` 返回仅存于页面内存的 CSRF 令牌。
-- `GET /api/auth/me` 为无副作用的只读用户资料接口；刷新浏览器页面应调用 `POST /api/auth/refresh` 恢复会话并取得新的 CSRF 令牌。
+- 管理会话支持明确选择的两种模式：同源 HttpOnly、Secure、SameSite=Lax Cookie，或供 OSS 跨站访问的内存 Bearer。会话和 CSRF 不写入浏览器持久存储。
+- `GET /api/auth/me` 为无副作用的只读用户资料接口；Cookie 模式通过 `POST /api/auth/refresh` 恢复会话，Bearer 模式刷新页面后需重新登录。
 - 管理员可管理账户、设备登记记录和审计；普通用户仅可访问自己的资料和设备记录，不能读取或修改他人数据。服务端执行角色与账户隔离。
 - 修改账户密码、角色、启用状态或网络权限会立即撤销该账户的管理会话。
 - 设备名单只是管理记录。每账户最多 10 条 `registered` 记录，`removed` 记录不占名额；它不认证设备，也不会阻止取得账户密码的新设备登录或连接 VPN。
-- 审计记录登录成功/失败、退出和管理操作；不会写入密码、哈希、Cookie 或请求体。
+- 审计记录登录成功/失败、退出和管理操作；不会写入密码、哈希、Cookie、Bearer 令牌或请求体。
 
 ## 运行环境与安装
 
@@ -43,9 +43,11 @@ vault_command_that_emits_json | python -m vpn_manager.bootstrap --database /var/
 暂存部署直接由 Uvicorn 提供 HTTPS，绑定服务器内部 IP；当前不需要 Nginx 或客户端证书。运行时只读取以下环境变量：
 
 - `VPN_MANAGER_DB`：已完成账户初始化的 SQLite 数据库路径。
-- `VPN_MANAGER_WEB_DIRECTORY`：静态网页目录（通常为仓库的 `web/`）。
+- `VPN_MANAGER_WEB_DIRECTORY`：可选静态网页目录；OSS 部署时不设置，进程只提供 API。
 - `VPN_MANAGER_ORIGIN`：唯一允许的 HTTPS 浏览器 Origin，例如 `https://manager.example.internal`。
+- `VPN_MANAGER_SESSION_TRANSPORT`：`cookie`（默认）或 `bearer`；跨站 OSS 前端必须明确使用 `bearer`，与静态配置一致。
 - `VPN_MANAGER_GATEWAY_PUBLIC_KEY` 和 `VPN_MANAGER_GATEWAY_SOCKET`：可选但必须成对配置，分别为受控 X25519 公钥文件与绝对 Unix socket 路径。Web 进程不直接运行网关投递；需另启 `python -m vpn_manager.gateway_sync --database PATH --socket PATH --watch`，由 systemd 管理唯一实例。持续模式默认每 5 秒处理待同步任务，也可用 `--once` 执行一次。
+- `VPN_MANAGER_REQUIRE_GATEWAY`：仅接受 `true` 或 `false`，默认 `false` 供开发使用。正式部署必须设为 `true`，缺少完整网关配置即拒绝启动；它不会把排队状态变成已生效状态，仍需确认 `applied` 并实测 VPN。
 
 将 `INTERNAL_IP` 替换为服务器的内部监听地址，并确保私钥文件只对运行服务的账户可读：
 
@@ -57,13 +59,16 @@ python -m vpn_manager.runtime --bind INTERNAL_IP --port 8443 \
   --cert /protected/server.pem --key /protected/server.key
 ```
 
-不要使用 `--reload`，不要将监听地址改为未评估的公网地址，也不要把密钥、密码或 Cookie 写入日志。ECS 的内部地址可能由 EIP 映射，必须在安全组或主机防火墙验证只允许预期的 VPN 来源；仅绑定内部 IP 不构成公网隔离。OpenAPI、Swagger 和 ReDoc 不应作为公开入口。生产网络暴露、TLS 证书轮换、备份恢复、审计留存和真实浏览器验收仍待实际部署环境验证。
+不要使用 `--reload`，不要将监听地址改为未评估的公网地址，也不要把密钥、密码或会话令牌写入日志。ECS 的内部地址可能由 EIP 映射；仅绑定内部 IP 不构成公网隔离。内网入口需限制 VPN 来源，公网 API 则需明确评估来源、端口、认证及限流，并单独验证主机防火墙和安全组。OpenAPI、Swagger 和 ReDoc 不应作为公开入口。独立管理 API 的部署约束见 [部署说明](deploy/README.md)；生产网络暴露、TLS 证书续期、备份恢复、审计留存和真实浏览器验收仍待实际部署环境验证。
 
 ## 浏览器认证与接口约定
 
-浏览器只能从 `VPN_MANAGER_ORIGIN` 指定的精确 HTTPS Origin 调用 API。浏览器自动携带会话 Cookie；前端使用 `credentials: "include"`，不读写 `localStorage` 或 `sessionStorage`。
+浏览器只能从 `VPN_MANAGER_ORIGIN` 指定的精确 HTTPS Origin 调用 API。前端配置与服务端的会话模式必须一致，两种模式均不读写 `localStorage` 或 `sessionStorage`：
 
-`POST /api/auth/login` 成功后返回 `{ "user": UserView, "csrf_token": string }`。`GET /api/auth/me` 仅返回 `UserView`，不轮换 CSRF。`POST /api/auth/refresh` 依赖已有 Cookie 与严格 Origin，返回扁平 `UserView` 字段和新的 `csrf_token`。所有状态修改请求必须携带最新的 `X-CSRF-Token`；错误体为 `{ "error": { "code": string, "message": string } }`。
+- 同源 `cookie` 模式使用 `credentials: "include"`，登录返回 `{ "user": UserView, "csrf_token": string }`，会话通过安全 Cookie 传递。`POST /api/auth/refresh` 依赖已有 Cookie 与严格 Origin，返回扁平 `UserView` 字段和新的 `csrf_token`。
+- OSS 跨站 `bearer` 模式使用 `credentials: "omit"`，登录响应另含 `session_token`；前端仅在内存中保存，并通过 `Authorization: Bearer ...` 发送。刷新页面或关闭页面后需重新登录，不能借助 Cookie 恢复会话。
+
+`GET /api/auth/me` 仅返回 `UserView`，不轮换 CSRF。所有状态修改请求必须携带最新的 `X-CSRF-Token`；错误体为 `{ "error": { "code": string, "message": string } }`。
 
 接口包括：
 

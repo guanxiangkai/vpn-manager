@@ -4,6 +4,8 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'">
+    <meta name="referrer" content="no-referrer">
     <title>VPN 管理器</title>
     <link rel="stylesheet" href="styles.css">
   </head>
@@ -47,6 +49,7 @@
         <section id="overview-page" class="page" aria-labelledby="overview-title">
           <p class="eyebrow">账户与网络</p><h1 id="overview-title">已授权访问</h1>
           <div id="profile-state" class="state-panel" aria-live="polite">正在读取账户信息…</div>
+          <p id="vpn-integration-state" class="warning" aria-live="polite">正在核对 VPN 接入状态…</p>
           <div id="profile-content" hidden>
             <dl class="details-list"><div><dt>账户</dt><dd id="profile-username"></dd></div><div><dt>角色</dt><dd id="profile-role"></dd></div><div><dt>账户状态</dt><dd id="profile-status"></dd></div></dl>
             <h2>授权网络</h2><div id="network-list" class="network-list"></div>

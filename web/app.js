@@ -1,5 +1,5 @@
 const DEFAULT_AUDIT_LIMIT = 20;
-const state = { apiBaseUrl: "", csrfToken: null, user: null, usersSerial: 0, ownDevicesSerial: 0, deviceSerial: 0, deviceAccountsSerial: 0, deviceAccounts: [], selectedDeviceAccount: null, auditCursors: [null], auditIndex: 0, auditSerial: 0, requestIds: new Map() };
+const state = { apiBaseUrl: "", sessionTransport: "cookie", sessionToken: null, csrfToken: null, user: null, usersSerial: 0, ownDevicesSerial: 0, deviceSerial: 0, deviceAccountsSerial: 0, deviceAccounts: [], selectedDeviceAccount: null, auditCursors: [null], auditIndex: 0, auditSerial: 0, requestIds: new Map() };
 
 const $ = (selector) => document.querySelector(selector);
 const elements = {
@@ -37,14 +37,18 @@ async function loadConfig() {
     if (!response.ok) throw new Error("配置文件不可读取");
     const config = await response.json();
     if (typeof config.apiBaseUrl !== "string") throw new Error("apiBaseUrl 必须为字符串");
+    const transport = config.sessionTransport ?? "cookie";
+    if (!["cookie", "bearer"].includes(transport)) throw new Error("会话传输方式无效");
     // 空值代表同源 API；部署不需要也不应为了同源而填写伪造地址。
     if (config.apiBaseUrl) {
       const configuredUrl = new URL(config.apiBaseUrl, window.location.href);
       if (configuredUrl.protocol !== "https:") throw new Error("服务地址必须使用 HTTPS");
-      if (configuredUrl.origin !== window.location.origin || configuredUrl.username || configuredUrl.password) throw new Error("当前部署只支持同源 HTTPS API，配置中不得包含凭据");
+      if (configuredUrl.username || configuredUrl.password) throw new Error("配置中不得包含凭据");
+      if (configuredUrl.origin !== window.location.origin && transport !== "bearer") throw new Error("跨站 API 必须使用内存会话");
       if (configuredUrl.pathname !== "/" || configuredUrl.search || configuredUrl.hash) throw new Error("apiBaseUrl 只能是 API 主机的根 HTTPS 地址");
       state.apiBaseUrl = configuredUrl.origin;
     }
+    state.sessionTransport = transport;
   } catch (error) {
     setServiceUnavailable("无法读取服务配置。请检查 config.json。");
     return false;
@@ -52,7 +56,7 @@ async function loadConfig() {
   elements.serviceState.textContent = "正在检查服务状态…";
   try {
     await apiRequest("/health", { method: "GET" });
-    elements.serviceState.textContent = "服务可用。请输入账户名和密码。";
+    elements.serviceState.textContent = transportHint();
     return true;
   } catch (error) {
     setServiceUnavailable(`无法连接管理服务：${error.message}`);
@@ -61,6 +65,7 @@ async function loadConfig() {
 }
 
 function setServiceUnavailable(message) { elements.serviceState.className = "service-state error"; elements.serviceState.textContent = message; elements.loginSubmit.disabled = true; }
+function transportHint() { return state.sessionTransport === "bearer" ? "服务可用。请输入账户名和密码；刷新或关闭页面后需重新登录。" : "服务可用。请输入账户名和密码。"; }
 
 async function apiRequest(path, options = {}) {
   const controller = new AbortController();
@@ -70,9 +75,10 @@ async function apiRequest(path, options = {}) {
   const headers = new Headers(options.headers || {});
   if (options.body !== undefined) headers.set("Content-Type", "application/json");
   if (options.mutation && state.csrfToken) headers.set("X-CSRF-Token", state.csrfToken);
+  if (state.sessionTransport === "bearer" && state.sessionToken) headers.set("Authorization", `Bearer ${state.sessionToken}`);
   let response;
   try {
-    response = await fetch(apiUrl(path), { method: options.method || "GET", credentials: "include", headers, body: options.body === undefined ? undefined : JSON.stringify(options.body), signal: controller.signal });
+    response = await fetch(apiUrl(path), { method: options.method || "GET", credentials: state.sessionTransport === "bearer" ? "omit" : "include", cache: "no-store", redirect: "error", headers, body: options.body === undefined ? undefined : JSON.stringify(options.body), signal: controller.signal });
   } catch (error) {
     if (error.name === "AbortError") throw error;
     throw new Error("网络请求失败，请检查服务地址和网络连接。");
@@ -96,7 +102,22 @@ function renderProfile(user) {
   elements.signedInUser.textContent = `${user.username} · ${roleText(user.role)}`;
   document.querySelectorAll(".admin-only").forEach((item) => { item.hidden = user.role !== "admin"; });
   loadOwnDevices();
+  loadVpnStatus(user);
   elements.profileContent.hidden = false; elements.profileState.hidden = true;
+}
+
+async function loadVpnStatus(user) {
+  const panel = $("#vpn-integration-state");
+  panel.textContent = "正在核对 VPN 接入状态…";
+  try {
+    const result = await apiRequest("/api/vpn/status");
+    if (state.user !== user) return;
+    panel.textContent = result.state === "applied" ? "VPN 账户权限已同步；连接状态请以系统 VPN 设置为准。" : "VPN 账户权限尚未同步完成，请继续使用现有连接方式。";
+  } catch (error) {
+    if (state.user !== user || error.name === "AbortError") return;
+    if (isSessionError(error)) { showLogin(); return; }
+    panel.textContent = error.code === "gateway_unavailable" ? "VPN 接入尚未切换：此处显示账户授权，现有 VPN 继续使用原方式；当前无法通过本页面撤销原 VPN 连接。" : "暂时无法核对 VPN 接入状态，请勿将账户资料视为连接已生效。";
+  }
 }
 
 function showLogin() {
@@ -104,7 +125,7 @@ function showLogin() {
   state.usersSerial += 1; state.ownDevicesSerial += 1; state.deviceSerial += 1; state.deviceAccountsSerial += 1; state.auditSerial += 1;
   state.deviceAccounts = []; state.selectedDeviceAccount = null; state.auditCursors = [null]; state.auditIndex = 0;
   state.requestIds.forEach((controller) => controller.abort()); state.requestIds.clear();
-  state.user = null; state.csrfToken = null;
+  state.user = null; state.csrfToken = null; state.sessionToken = null;
   if (elements.userDialog.open) elements.userDialog.close();
   if (elements.deviceDialog.open) elements.deviceDialog.close();
   elements.userForm.reset(); elements.deviceForm.reset();
@@ -120,6 +141,8 @@ function acceptCurrentSession(response) {
 }
 
 async function restoreSession() {
+  // OSS 与 API 跨站时不依赖第三方 Cookie，也不从磁盘恢复会话。
+  if (state.sessionTransport === "bearer") { showLogin(); return; }
   try {
     // 仅 POST refresh 可轮换 CSRF；GET /me 是无副作用的只读资料接口。
     acceptCurrentSession(await apiRequest("/api/auth/refresh", { method: "POST" }));
@@ -142,6 +165,10 @@ async function submitLogin(event) {
   try {
     const response = await apiRequest("/api/auth/login", { method: "POST", body: { username: $("#username").value.trim(), password: $("#password").value } });
     if (!response?.user || typeof response.csrf_token !== "string") throw new Error("服务返回的登录信息不完整。");
+    if (state.sessionTransport === "bearer") {
+      if (typeof response.session_token !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(response.session_token)) throw new Error("服务未启用跨站会话，请联系管理员。");
+      state.sessionToken = response.session_token;
+    }
     // 登录已提供新 CSRF；不再借由 GET 请求轮换它。
     state.csrfToken = response.csrf_token; showApp(response.user); showNotice("登录成功。");
   } catch (error) { showError(elements.loginError, humanError(error)); } finally { setBusy(elements.loginSubmit, false, ""); }

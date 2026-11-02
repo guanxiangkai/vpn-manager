@@ -1,4 +1,4 @@
-"""内部 HTTPS 服务入口；不修改系统网络、VPN、代理或防火墙。"""
+"""独立 HTTPS API 入口；不修改系统网络、VPN、代理或防火墙。"""
 from __future__ import annotations
 
 import argparse
@@ -44,21 +44,32 @@ def _load_gateway_public_key(value: str) -> bytes:
     return data
 
 
+def _require_gateway() -> bool:
+    """解析生产保护开关；除 true/false 外拒绝启动，避免拼写被静默忽略。"""
+    value = os.environ.get("VPN_MANAGER_REQUIRE_GATEWAY", "false").strip().lower()
+    if value not in {"true", "false"}:
+        raise RuntimeError("VPN_MANAGER_REQUIRE_GATEWAY 必须为 true 或 false")
+    return value == "true"
+
+
 def application():
-    required = ("VPN_MANAGER_DB", "VPN_MANAGER_WEB_DIRECTORY", "VPN_MANAGER_ORIGIN")
+    required = ("VPN_MANAGER_DB", "VPN_MANAGER_ORIGIN")
     if any(not os.environ.get(name) for name in required):
         raise RuntimeError("管理服务缺少必要配置，拒绝启动")
     database = Path(os.environ["VPN_MANAGER_DB"])
     if not database.is_file():
         raise RuntimeError("必须先完成账户初始化")
+    require_gateway = _require_gateway()
     public_key_path, socket_path = os.environ.get("VPN_MANAGER_GATEWAY_PUBLIC_KEY"), os.environ.get("VPN_MANAGER_GATEWAY_SOCKET")
     if bool(public_key_path) != bool(socket_path):
         raise RuntimeError("网关公钥与 Unix socket 必须同时配置")
+    if require_gateway and not (public_key_path and socket_path):
+        raise RuntimeError("生产保护模式要求同时配置网关公钥与 Unix socket")
     gateway_public_key = _load_gateway_public_key(public_key_path) if public_key_path else None
     if socket_path and not Path(socket_path).is_absolute():
         raise RuntimeError("网关 Unix socket 必须使用绝对路径")
     gateway_client = GatewayClient(socket_path) if socket_path else None
-    return create_app(database, allowed_origin=os.environ["VPN_MANAGER_ORIGIN"], web_directory=os.environ["VPN_MANAGER_WEB_DIRECTORY"], gateway_public_key=gateway_public_key, gateway_client=gateway_client)
+    return create_app(database, allowed_origin=os.environ["VPN_MANAGER_ORIGIN"], web_directory=os.environ.get("VPN_MANAGER_WEB_DIRECTORY") or None, gateway_public_key=gateway_public_key, gateway_client=gateway_client, session_transport=os.environ.get("VPN_MANAGER_SESSION_TRANSPORT", "cookie"))
 
 
 def main() -> None:
@@ -70,7 +81,7 @@ def main() -> None:
     args = parser.parse_args()
     address = ip_address(args.bind)
     if address.is_unspecified or address.is_multicast or not address.is_private:
-        parser.error("当前部署只允许绑定明确的内部 IP；公网入口等待备案后配置")
+        parser.error("服务必须绑定明确的本地内部 IP，公网映射由部署层单独配置")
     if not 1024 <= args.port <= 65535:
         parser.error("端口必须在 1024–65535 之间")
     # TLS 私钥必须在 Linux 主机受控保存，不能放进仓库或输出目录。

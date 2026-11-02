@@ -72,6 +72,8 @@ class UserView(StrictModel):
 class LoginResponse(StrictModel):
     user: UserView
     csrf_token: str
+    # 仅跨站部署返回；浏览器只在内存保存，禁止写入本地存储。
+    session_token: str | None = None
 
 
 class MeResponse(UserView):

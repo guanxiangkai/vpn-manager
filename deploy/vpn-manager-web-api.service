@@ -1,0 +1,37 @@
+# 独立管理 API 不依赖 VPN 网关或同步代理，启动和重启不会接管 VPN。
+[Unit]
+Description=VPN 管理器独立 HTTPS API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vpn-manager
+Group=vpn-manager
+EnvironmentFile=/etc/vpn-manager/web-api.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=VPN_MANAGER_REQUIRE_GATEWAY=true
+# Web 使用独立发布目录；更新管理界面不替换 VPN 网关运行时。
+LoadCredential=web-cert:/etc/vpn-manager/web-api-fullchain.pem
+LoadCredential=web-key:/etc/vpn-manager/web-api-key.pem
+ExecStart=/opt/vpn-manager/web-current/venv/bin/python -m vpn_manager.runtime --bind ${VPN_MANAGER_BIND} --port ${VPN_MANAGER_PORT} --cert ${CREDENTIALS_DIRECTORY}/web-cert --key ${CREDENTIALS_DIRECTORY}/web-key
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+MemoryMax=250M
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/vpn-manager/api
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

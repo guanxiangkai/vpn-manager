@@ -30,7 +30,7 @@ jobs:
       - name: 检查依赖一致性
         run: python -m pip check
       - name: 运行接口与网关回归测试
-        run: timeout 240 python -m pytest tests/test_api.py tests/test_gateway_sync.py tests/test_gateway_agent.py -v -p no:cacheprovider
+        run: timeout 240 python -m pytest tests/test_api.py tests/test_cross_origin_session.py tests/test_gateway_sync.py tests/test_gateway_agent.py tests/test_web_certificate.py -v -p no:cacheprovider
       - name: 运行原生 HTTPS Chromium 验收
         run: timeout 240 bash tests/run_browser_acceptance.sh
         env:
@@ -43,3 +43,5 @@ jobs:
           path: .runtime/browser-evidence/*.png
           retention-days: 7
           if-no-files-found: warn
+      - name: 运行跨站 Bearer HTTPS Chromium 验收
+        run: timeout 240 bash tests/run_cross_origin_acceptance.sh
