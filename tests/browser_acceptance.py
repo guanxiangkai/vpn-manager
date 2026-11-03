@@ -130,7 +130,7 @@ def test_admin_login_refresh_pages_and_logout(context, live_env):
 def test_member_can_read_own_records_but_cannot_see_admin_management(context, live_env):
     page = context.new_page()
     _login(page, live_env, MEMBER)
-    expect(page.get_by_role("heading", name="我的设备登记记录", exact=True)).to_be_visible()
+    expect(page.get_by_role("heading", name="我的设备记录", exact=True)).to_be_visible()
     expect(page.locator("#own-devices-content")).to_be_visible(timeout=15_000)
     for page_name in ("users", "devices", "audit"):
         expect(page.locator(f'.nav-item[data-page="{page_name}"]')).to_be_hidden()
