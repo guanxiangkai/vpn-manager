@@ -22,6 +22,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
 from .gateway_sync import MAX_MESSAGE_BYTES, open_credential
+from .home_egress import HomeEgressRouter, NON_PUBLIC_V4, home_enabled
 
 
 class ProjectionError(Exception):
@@ -170,8 +171,11 @@ class ViciDriver:
     def load(self, username: str, account: dict[str, Any]) -> None:
         name = self.name(username)
         local_ts = [self.settings["management_ip"] + "/32"]
-        for network in account["networks"]:
-            local_ts.extend(self.settings["networks"][network]["selectors"])
+        if home_enabled(self.settings, account):
+            local_ts = ["0.0.0.0/0"]
+        else:
+            for network in account["networks"]:
+                local_ts.extend(self.settings["networks"][network]["selectors"])
         # 每个用户只能匹配其已验证 EAP 身份，不能按可伪造的 IKE ID 分配权限。
         connection = {
             "version": "2", "local_addrs": [self.settings["local_address"]],
@@ -189,7 +193,16 @@ class ViciDriver:
             }},
         }
         with self.session() as session:
-            session.load_pool({name: {"addrs": account["pool"]}})
+            pool = {"addrs": account["pool"]}
+            if home_enabled(self.settings, account) and self.settings.get("home_internet", {}).get("dns"):
+                pool["dns"] = self.settings["home_internet"]["dns"]
+            session.load_pool({name: pool})
+            actual_pool = session.get_pools().get(name, {})
+            subnet = ipaddress.IPv4Network(account["pool"])
+            if (actual_pool.get("base") != str(next(subnet.hosts())).encode()
+                    or int(actual_pool.get("size", b"0")) != subnet.num_addresses - 2):
+                raise ProjectionError("pool_readback_failed")
+            # VICI 不返回池的 DNS 属性；DNS 下发须由真实客户端重连验收。
             session.load_shared({"id": name, "type": "NTLM", "data": bytes.fromhex(account["nt"]), "owners": [username]})
             session.load_conn({name: connection})
             if name.encode() not in session.get_conns().get("conns", []):
@@ -218,6 +231,7 @@ class NftFirewall:
 
     def __init__(self, settings: dict[str, Any]) -> None:
         self.settings = settings
+        self.egress = HomeEgressRouter(settings)
 
     @staticmethod
     def command(arguments: list[str], data: str | None = None) -> subprocess.CompletedProcess:
@@ -246,6 +260,14 @@ class NftFirewall:
                     ])
                     if "alias" in net:
                         result.append(f'add rule ip {self.nat_table} prerouting {prefix_in} ip daddr {net["alias"]} dnat ip prefix to ip daddr map {{ {net["alias"]} : {net["real"]} }}')
+                if home_enabled(self.settings, account):
+                    home = self.settings["networks"]["home"]
+                    public = ", ".join(NON_PUBLIC_V4)
+                    result.extend([
+                        f'add rule inet {self.table} {self.forward_chain} {prefix_in} ip daddr != {{ {public} }} oifname "{home["interface"]}" accept',
+                        f'add rule inet {self.table} {self.forward_chain} {prefix_out} ip saddr != {{ {public} }} iifname "{home["interface"]}" ct state established,related accept',
+                        f'add rule ip {self.nat_table} postrouting ip saddr {pool} ip daddr != {{ {public} }} oifname "{home["interface"]}" snat to {home["snat"]}',
+                    ])
             # 未通过 reqid+源地址双重验证的流量，以及降权前遗留的连接，都在 established 规则前拒绝。
             for condition in (f"ipsec in reqid {reqid}", f"ip saddr {pool}"):
                 result.append(f"add rule inet {self.table} {self.input_chain} {condition} drop")
@@ -282,10 +304,18 @@ class NftFirewall:
                     raise ProjectionError("firewall_owner_conflict")
             else:
                 commands.append(f'insert rule inet {self.table} {base} jump {target} comment "{comment}"')
-        commands.append(self.rules(accounts, quarantined))
-        batch = "\n".join(commands)
+        batch = "\n".join(commands + [self.rules(accounts, quarantined)])
         self.command(["--check", "-f", "-"], batch)
-        self.command(["-f", "-"], batch)
+        if self.egress.configured:
+            # 路由操作不具备事务性；先隔离全部托管池，失败也不会保留旧授权。
+            blocked = "\n".join(commands + [self.rules(accounts, set(accounts))])
+            self.command(["--check", "-f", "-"], blocked)
+            self.command(["-f", "-"], blocked)
+            self.egress.sync(accounts, quarantined)
+            # 链已由隔离批次创建；仅在规则精确回读后开放目标权限。
+            self.command(["-f", "-"], self.rules(accounts, quarantined))
+        else:
+            self.command(["-f", "-"], batch)
 
 
 class GatewayAgent:

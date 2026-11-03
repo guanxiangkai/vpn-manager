@@ -30,7 +30,7 @@ jobs:
       - name: 检查依赖一致性
         run: python -m pip check
       - name: 运行接口与网关回归测试
-        run: timeout 300 python -m pytest tests/test_api.py tests/test_cross_origin_session.py tests/test_gateway_sync.py tests/test_gateway_agent.py tests/test_web_certificate.py tests/test_web_certificate_renew.py tests/test_tls_private_key.py -v -p no:cacheprovider
+        run: timeout 300 python -m pytest tests/test_api.py tests/test_cross_origin_session.py tests/test_gateway_sync.py tests/test_gateway_agent.py tests/test_web_certificate.py tests/test_web_certificate_renew.py tests/test_tls_private_key.py tests/test_home_egress.py tests/test_home_firewall_order.py tests/test_home_egress_publish.py tests/test_home_egress_rollback.py -v -p no:cacheprovider
       - name: 运行原生 HTTPS Chromium 验收
         run: timeout 240 bash tests/run_browser_acceptance.sh
         env:

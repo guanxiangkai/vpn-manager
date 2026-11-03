@@ -14,7 +14,7 @@ import subprocess
 import time
 import uuid
 import vici
-from vpn_manager.gateway_agent import GatewayAgent, NftFirewall, ViciDriver, initialize
+from vpn_manager.gateway_agent import GatewayAgent, NftFirewall, ViciDriver, ProjectionError, initialize
 from vpn_manager.gateway_sync import seal_credential
 
 class Acceptance:
@@ -26,6 +26,7 @@ class Acceptance:
         self.ns = {n:'v'+self.root.name+n[0] for n in ('client','gateway','lan')}
         self.created, self.processes, self.checks = [], [], []
         self.sockets, self.generation = {}, {'admin':0,'member':0}
+        self._projection_errors = []
         self.passwords = {n:secrets.token_urlsafe(24) for n in self.generation}
     def run(self, args, ns=None, data=None, success=True, timeout=10):
         command = (['ip','netns','exec',self.ns[ns]] if ns else []) + list(map(str,args))
@@ -39,6 +40,39 @@ class Acceptance:
     def check(self,name,condition):
         self.checks.append({'name':name,'passed':bool(condition)})
         if not condition: raise RuntimeError('check_failed:'+name)
+    def _diagnostic_wrap(self, owner, name):
+        """Capture only fixed exception metadata from fixture projection calls."""
+        marker = '_fixture_diag_' + name
+        if getattr(owner, marker, False): return
+        original = getattr(owner, name)
+        def wrapped(*args, **kwargs):
+            try:
+                return original(*args, **kwargs)
+            except Exception as error:
+                self._projection_errors.append({
+                    'operation': name,
+                    'type': type(error).__name__,
+                    'args': list(error.args) if isinstance(error, ProjectionError) else [],
+                })
+                raise
+        setattr(owner, name, wrapped)
+        setattr(owner, marker, True)
+    def _projection_diagnostic(self, reply):
+        result = {'reply': {k: reply[k] for k in ('state', 'code') if k in reply},
+                  'errors': list(self._projection_errors), 'gateway': {}}
+        for label, command in (
+            ('route_table_150', ['ip', '-4', '-j', 'route', 'show', 'table', '150']),
+            ('ip_rules', ['ip', '-4', '-j', 'rule', 'show']),
+        ):
+            p = self.run(command, 'gateway', success=False)
+            result['gateway'][label] = {'returncode': p.returncode,
+                                        'stdout': p.stdout.decode(errors='replace'),
+                                        'stderr': p.stderr.decode(errors='replace')}
+        p = self.run(['nft', '-c', '-f', '-'], 'gateway', data=b'', success=False)
+        result['gateway']['nftcheck'] = {'returncode': p.returncode,
+                                         'stderr': p.stderr.decode(errors='replace')}
+        (self.root / 'projection-diagnostic.json').write_text(
+            json.dumps(result, sort_keys=True, indent=2))
     def topology(self):
         for role,name in self.ns.items():
             self.run(['ip','netns','add',name]); self.created.append(name)
@@ -99,7 +133,10 @@ class Acceptance:
     def project(self,username,networks,active=True,password=False):
         self.generation[username]+=1;g=self.generation[username]
         envelope=seal_credential(self.public,username,g,self.passwords[username]) if password else None
+        for operation in ('install',): self._diagnostic_wrap(self.agent.firewall, operation)
+        for operation in ('load', 'forget', 'terminate'): self._diagnostic_wrap(self.agent.driver, operation)
         reply=self.agent.apply({'action':'apply_account','operation_id':uuid.uuid4().hex,'username':username,'generation':g,'active':active,'networks':networks,'credential_envelope':envelope})
+        if reply.get('state') == 'pending': self._projection_diagnostic(reply)
         self.check('projection_'+username+'_'+str(g),reply['state']=='applied')
     def clean_client(self):
         with self.session('client') as s:
