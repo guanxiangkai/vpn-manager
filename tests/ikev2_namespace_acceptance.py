@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shlex
 import signal
 import socket
 import subprocess
@@ -109,6 +110,19 @@ class Acceptance:
         conf,control=directory/'strongswan.conf',directory/'vici'
         resolver = directory / 'resolv.conf'
         resolver.write_text('nameserver 10.240.2.1\n')
+        received_dns = directory / 'received-dns.conf'
+        received_dns.touch()
+        resolvconf = directory / 'resolvconf'
+        # Capture IKE-provided DNS in the fixture without invoking the host resolver.
+        resolvconf.write_text('''#!/bin/sh
+set -eu
+case "$1" in
+    -a) cat > "${0%/*}/received-dns.conf" ;;
+    -d) : > "${0%/*}/received-dns.conf" ;;
+    *) exit 2 ;;
+esac
+''')
+        resolvconf.chmod(0o700)
         conf.write_text(f'''charon {{
  plugins {{
   vici {{
@@ -117,7 +131,7 @@ class Acceptance:
   resolve {{
    file = {resolver}
    resolvconf {{
-    path = {directory}/resolvconf-disabled
+    path = "{shlex.quote(str(resolvconf))}"
    }}
   }}
  }}
