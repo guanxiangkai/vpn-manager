@@ -101,7 +101,9 @@ def collect(vici_session: Any, *, now: dt.datetime | None = None) -> dict[str, A
 
 def _safe_socket(path: Path) -> None:
     info = path.lstat()
-    if not path.is_absolute() or not stat.S_ISSOCK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077 or str(path.resolve()) in {"/run/charon.vici", "/var/run/charon.vici"}:
+    if (not path.is_absolute() or not stat.S_ISSOCK(info.st_mode)
+            or (info.st_uid, info.st_gid) != (0, 0) or info.st_mode & 0o007
+            or str(path.resolve()) in {"/run/charon.vici", "/var/run/charon.vici"}):
         raise ObserverError("unsafe_vici_socket")
 
 
