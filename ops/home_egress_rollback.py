@@ -169,6 +169,9 @@ def _validate_journal(value: dict[str, Any]) -> None:
     for key in ("baseline_module_hash", "config_hash", "candidate_module_hash", "candidate_config_hash", "extra_hash"):
         if not _is_sha256(value.get(key)):
             raise RollbackError("rollback_journal_invalid")
+    if "split_config" in value and (value["split_config"] not in ("staged", "applying")
+                                    or value["baseline_module_hash"] != value["candidate_module_hash"]):
+        raise RollbackError("rollback_journal_invalid")
     if not isinstance(value.get("agent_service"), str) or re.fullmatch(r"[A-Za-z0-9_.@-]+\.service", value["agent_service"]) is None:
         raise RollbackError("rollback_journal_invalid")
     routing = value.get("routing")
@@ -572,6 +575,15 @@ def _release_agent_lock(descriptor: int) -> None:
     os.close(descriptor)
 
 
+def _stop_split_timer(transaction: Path, runner: Runner) -> None:
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", transaction.name) is None:
+        raise RollbackError("rollback_txn_name_invalid")
+    timer = f"vpn-home-egress-rollback-{transaction.name}.timer"
+    if (_rc(runner(["/bin/systemctl", "disable", "--now", timer], None)) != 0
+            or _rc(runner(["/bin/systemctl", "is-active", "--quiet", timer], None)) != 3):
+        raise RollbackError("rollback_timer_stop_failed")
+
+
 def rollback(txn_dir: str | os.PathLike[str], *, runner: Runner = _default_runner, enforce_root: bool = True,
              status_probe: Optional[StatusProbe] = None) -> str:
     """执行或续接回滚；任一错误均保留阻断规则。"""
@@ -588,8 +600,25 @@ def rollback(txn_dir: str | os.PathLike[str], *, runner: Runner = _default_runne
         _validate_journal(journal)
         if journal["status"] == "accepted":
             return "accepted"
+        split_config = journal.get("split_config")
         if journal["status"] == "rolled_back":
+            if split_config:
+                _stop_split_timer(transaction, runner)
             return "rolled_back"
+        if split_config == "staged":
+            _set_status(journal_path, journal, digest, "rolled_back", root_required=enforce_root)
+            _stop_split_timer(transaction, runner)
+            return "rolled_back"
+        if split_config:
+            for key, permitted_hashes in (
+                ("module_path", {journal["baseline_module_hash"]}),
+                ("extra_module_path", {journal["extra_hash"]}),
+                ("config_path", {journal["config_hash"], journal["candidate_config_hash"]}),
+            ):
+                path = _absolute_path(journal[key])
+                _safe_regular(path, root_required=enforce_root)
+                if _sha256(path) not in permitted_hashes:
+                    raise RollbackError("rollback_candidate_changed")
         if journal["status"] == "armed":
             journal, digest = _set_status(journal_path, journal, digest, "rolling_back", root_required=enforce_root)
 
@@ -613,7 +642,8 @@ def rollback(txn_dir: str | os.PathLike[str], *, runner: Runner = _default_runne
                       journal["candidate_module_hash"], journal["baseline_module_hash"], root_required=enforce_root)
         _restore_file(_absolute_path(journal["config_path"]), transaction / "baseline-gateway.json",
                       journal["candidate_config_hash"], journal["config_hash"], root_required=enforce_root)
-        _remove_extra(_absolute_path(journal["extra_module_path"]), journal["extra_hash"], root_required=enforce_root)
+        if not split_config:
+            _remove_extra(_absolute_path(journal["extra_module_path"]), journal["extra_hash"], root_required=enforce_root)
 
         # gateway_agent.main 会以 LOCK_NB 取得相同锁；持锁启动会使旧服务立即退出。
         _release_agent_lock(agent_lock)
@@ -635,6 +665,8 @@ def rollback(txn_dir: str | os.PathLike[str], *, runner: Runner = _default_runne
             _service(runner, "stop", journal["agent_service"])
             raise
         _set_status(journal_path, journal, digest, "rolled_back", root_required=enforce_root)
+        if split_config:
+            _stop_split_timer(transaction, runner)
         return "rolled_back"
     finally:
         if agent_lock is not None:
