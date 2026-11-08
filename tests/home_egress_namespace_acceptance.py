@@ -14,6 +14,7 @@ class Acceptance(BaseAcceptance):
     SYNTHETIC_WORK = '203.0.113.1'
     SYNTHETIC_MANAGEMENT = '198.18.0.2'
     LOCAL_DNS = '10.240.2.1'
+    LOCAL_ADDRESS = '10.240.2.2'
 
     def topology(self):
         super().topology()
@@ -30,34 +31,52 @@ class Acceptance(BaseAcceptance):
         self.ns['isp'] = 'v' + self.root.name + 'i'
         self.run(['ip', 'netns', 'add', self.ns['isp']])
         self.created.append(self.ns['isp'])
+        for key in ('all', 'default'):
+            self.run(['sysctl', '-qw', f'net.ipv4.conf.{key}.rp_filter=0'], 'isp')
         self.run(['ip', 'link', 'add', 'uplink', 'type', 'veth', 'peer', 'name', 'isp0'], 'client')
         self.run(['ip', 'link', 'set', 'isp0', 'netns', self.ns['isp']], 'client')
         for role, link, address in (
-            ('client', 'uplink', '10.240.2.2/24'),
+            ('client', 'uplink', self.LOCAL_ADDRESS + '/24'),
             ('isp', 'isp0', self.LOCAL_DNS + '/24'),
         ):
             self.run(['ip', 'addr', 'add', address, 'dev', link], role)
             self.run(['ip', 'link', 'set', link, 'up'], role)
         self.run(['ip', 'link', 'set', 'lo', 'up'], 'isp')
         self.run(['ip', 'addr', 'add', self.SYNTHETIC_INTERNET + '/32', 'dev', 'lo'], 'isp')
-        self.run(['ip', 'route', 'add', self.SYNTHETIC_INTERNET + '/32', 'via', self.LOCAL_DNS], 'client')
+        self.run(['ip', 'route', 'replace', 'default', 'via', self.LOCAL_DNS, 'dev', 'uplink'], 'client')
+        self.verify_public_direct('baseline')
 
-    def resolver_nameservers(self):
-        lines = (self.root / 'client' / 'resolv.conf').read_text().splitlines()
+    def resolver_nameservers(self, filename):
+        lines = (self.root / 'client' / filename).read_text().splitlines()
         return [line.split()[1] for line in lines if line.startswith('nameserver ')]
+
+    def verify_public_direct(self, phase):
+        route = self.run(['ip', '-j', 'route', 'get', self.SYNTHETIC_INTERNET], 'client')
+        selected = json.loads(route.stdout)[0]
+        self.check(phase + '_public_route_uses_local_uplink',
+                   selected['dev'] == 'uplink' and selected['prefsrc'] == self.LOCAL_ADDRESS)
+        result = self.run(['ping', '-n', '-c', '1', '-W', '1', self.SYNTHETIC_INTERNET],
+                          'client', success=False, timeout=4)
+        if result.returncode:
+            evidence = [route.stdout, result.stdout, result.stderr]
+            for command, role in ((['ip', '-j', 'addr'], 'client'),
+                                  (['ip', '-j', 'rule'], 'client'),
+                                  (['ip', '-j', 'xfrm', 'policy'], 'client'),
+                                  (['ip', '-j', 'route', 'get', self.LOCAL_ADDRESS], 'isp')):
+                diagnostic = self.run(command, role, success=False)
+                evidence.extend((diagnostic.stdout, diagnostic.stderr))
+            (self.root / 'last-command.stderr').write_bytes(b'\n'.join(evidence))
+        self.check(phase + '_public_access_uses_local_uplink', result.returncode == 0)
 
     def verify_split(self):
         self.connect('admin')
-        self.check('split_retains_local_dns', self.resolver_nameservers() == [self.LOCAL_DNS])
+        self.check('split_retains_local_dns', self.resolver_nameservers('resolv.conf') == [self.LOCAL_DNS])
+        self.check('split_has_no_vpn_dns', not self.resolver_nameservers('received-dns.conf'))
+        self.verify_public_direct('split')
         self.ping(self.SYNTHETIC_HOME, True, 'split_admin_home')
         self.ping(self.SYNTHETIC_HOME_ALIAS, True, 'split_admin_home_alias')
         self.ping(self.SYNTHETIC_WORK, True, 'split_admin_work')
         self.ping(self.SYNTHETIC_INTERNET, False, 'split_no_public_vpn_path')
-        route = self.run(['ip', '-j', 'route', 'get', self.SYNTHETIC_INTERNET], 'client')
-        self.check('split_public_route_uses_local_uplink', json.loads(route.stdout)[0]['dev'] == 'uplink')
-        result = self.run(['ping', '-n', '-c', '1', '-W', '1', self.SYNTHETIC_INTERNET], 'client',
-                          success=False, timeout=4)
-        self.check('split_public_access_uses_local_uplink', result.returncode == 0)
         self.connect('member')
         self.ping(self.SYNTHETIC_WORK, True, 'split_member_work')
         self.ping(self.SYNTHETIC_HOME, False, 'split_member_home_denied')
@@ -91,7 +110,7 @@ class Acceptance(BaseAcceptance):
             self.verify_split()
             return
         self.connect('admin'); self.ping(self.SYNTHETIC_INTERNET, True, 'admin_synthetic_internet')
-        self.check('full_vpn_pushes_home_dns', self.SYNTHETIC_HOME in self.resolver_nameservers())
+        self.check('full_vpn_pushes_home_dns', self.resolver_nameservers('received-dns.conf') == [self.SYNTHETIC_HOME])
         self.ping(self.SYNTHETIC_HOME, True, 'admin_home'); self.ping(self.SYNTHETIC_HOME_ALIAS, True, 'admin_home_alias'); self.ping(self.SYNTHETIC_WORK, True, 'admin_work')
         self.connect('member'); self.ping(self.SYNTHETIC_INTERNET, False, 'member_synthetic_internet_denied')
         self.ping(self.SYNTHETIC_WORK, True, 'member_work'); self.ping(self.SYNTHETIC_HOME, False, 'member_home_denied')
