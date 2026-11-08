@@ -8,6 +8,99 @@ permissions:
   contents: read
 
 jobs:
+  rollback-watchdog:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Exercise timer firing and lock retry with real systemd
+        run: |
+          sudo /usr/bin/python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          import time
+          from unittest.mock import patch
+
+          from ops import home_egress_publish as publish
+
+          def systemctl(*args, check=True):
+              return subprocess.run(
+                  ["/bin/systemctl", *args], check=check, capture_output=True,
+                  text=True, timeout=15,
+              )
+
+          def wait_for(predicate, message):
+              deadline = time.monotonic() + 30
+              while time.monotonic() < deadline:
+                  if predicate():
+                      return
+                  time.sleep(0.2)
+              raise RuntimeError(message)
+
+          os.umask(0o077)
+          with tempfile.TemporaryDirectory(prefix="vpn-watchdog-") as temporary:
+              txn = Path(temporary)
+              service, timer = publish._unit_names(txn)
+              journal = txn / "journal.json"
+              rollback_python = Path(sys.executable).resolve(strict=True)
+              unchanged = txn / "gateway.json"
+              unchanged.write_bytes(b'{"home_internet":{"enabled":true}}\n')
+              baseline = publish._sha256(unchanged)
+              record = dict.fromkeys(
+                  ("baseline_module_hash", "candidate_module_hash", "config_hash",
+                   "candidate_config_hash", "extra_hash"), baseline,
+              )
+              record.update({
+                  "status": "prepared", "split_config": "staged", "known_pools": [],
+                  "agent_service": "fixture-agent.service", "rollback_python": str(rollback_python),
+                  "routing": {"table": 150, "priority": 18000, "protocol": 186},
+              })
+              for key in ("module_path", "extra_module_path", "accounts_path",
+                          "state_lock_path", "control_socket_path"):
+                  record[key] = str(txn / key)
+              record["config_path"] = str(unchanged)
+              journal.write_text(json.dumps(record))
+              shutil.copyfile("ops/home_egress_rollback.py", txn / "home_egress_rollback.py")
+              generated = publish._unit_contents
+
+              def short_timer(transaction, python):
+                  service_text, timer_text = generated(transaction, python)
+                  if b"OnActiveSec=20min\n" not in timer_text:
+                      raise RuntimeError("unexpected_production_timer_definition")
+                  return service_text, timer_text.replace(
+                      b"OnActiveSec=20min\n", b"OnActiveSec=3s\nAccuracySec=100ms\n",
+                  )
+
+              try:
+                  with patch.object(publish, "_unit_contents", short_timer):
+                      assert publish.arm(txn) == "armed"
+                  lock = publish._lock(txn)
+                  try:
+                      wait_for(lambda: systemctl("show", service, "-p", "SubState", "--value")
+                               .stdout.strip() == "auto-restart", "timer_did_not_retry_held_lock")
+                      assert publish.status(txn) == "armed"
+                  finally:
+                      os.close(lock)
+                  wait_for(lambda: publish.status(txn) == "rolled_back"
+                           and systemctl("is-active", "--quiet", timer, check=False).returncode == 3,
+                           "timer_retry_did_not_close_transaction")
+                  assert publish._sha256(unchanged) == baseline
+                  assert systemctl("is-enabled", timer, check=False).stdout.strip() == "disabled"
+                  print("Timer fired, retried after lock release, and closed the staged transaction.")
+              finally:
+                  for unit in (timer, service):
+                      systemctl("stop", unit, check=False)
+                      (publish.SYSTEMD_DIRECTORY / unit).unlink(missing_ok=True)
+                  systemctl("daemon-reload")
+          PY
+
   namespace-acceptance:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
