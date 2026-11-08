@@ -173,8 +173,9 @@ class TestHomeEgressPublish(unittest.TestCase):
         self.assertEqual(oct((self.txn / "journal.json").stat().st_mode & 0o777), "0o600")
 
     def test_prepare_rejects_invalid_explicit_home_dns(self):
+        self.home_dns = "not-an-ip-address"
         with self.assertRaisesRegex(publish.PublishError, "home_dns_invalid"):
-            publish._render_candidate_config(self.config, "not-an-ip-address")
+            self.prepare()
 
     def test_rollback_python_rejects_systemd_unsafe_paths(self):
         for name in ("rollback python", "rollback\npython", "rollback%python", "rollback'python"):
