@@ -56,7 +56,29 @@
 <div id="users-state" class="state-panel" aria-live="polite">正在读取账户列表…</div><div id="users-content" class="table-wrap" hidden tabindex="0" role="region" aria-label="账户列表"><table class="users-table"><thead><tr><th scope="col">账户</th><th scope="col">角色</th><th scope="col">授权网络</th><th scope="col">状态</th><th scope="col">操作</th></tr></thead><tbody id="users-body"></tbody></table></div><div class="table-footer"><span id="users-result-count" aria-live="polite"></span><span>权限由服务端校验</span></div></div>
 <p class="context-note"><svg class="icon" aria-hidden="true"><use href="#i-info"/></svg>账户授权不表示 VPN 已连接；接入同步情况可在访问概览中查看。</p></section>
 <section id="audit-page" class="page" aria-labelledby="audit-title" hidden><div class="page-heading"><div><p class="eyebrow">安全与记录</p><h1 id="audit-title">登录审计</h1><p class="page-description">查看管理服务中的登录与操作记录，追溯账户访问情况。</p></div><button id="refresh-audit" class="button secondary" type="button">刷新记录</button></div><div class="surface"><div class="surface-heading"><div class="heading-inline"><h2>访问与操作记录</h2><span class="subtle-label">最近在前</span></div><span class="small-text muted">每页 20 条</span></div><div id="audit-state" class="state-panel" aria-live="polite">正在读取审计记录…</div><div id="audit-content" hidden><div class="table-wrap" tabindex="0" role="region" aria-label="登录与操作审计表"><table class="audit-table"><thead><tr><th scope="col">时间</th><th scope="col">账户</th><th scope="col">动作</th><th scope="col">结果</th><th scope="col">来源 IP</th></tr></thead><tbody id="audit-body"></tbody></table></div><div class="pager"><span id="audit-result-count" class="muted small-text"></span><div><button id="audit-prev" class="button secondary" type="button" disabled>上一页</button><span id="audit-page-label" aria-live="polite"></span><button id="audit-next" class="button secondary" type="button" disabled>下一页</button></div></div></div></div><p class="context-note"><svg class="icon" aria-hidden="true"><use href="#i-info"/></svg>这里记录管理服务的访问和操作，不代表完整的 VPN 连接日志。</p></section>
-<section id="connections-page" class="page" aria-labelledby="connections-title" hidden><div class="page-heading"><div><p class="eyebrow">网关观测</p><h1 id="connections-title">实时会话</h1><p class="page-description">查看各账户当前的 IKEv2 连接。会话数可能与实际设备数不同。</p></div><button id="refresh-connections" class="button secondary" type="button">刷新会话</button></div><div id="connections-state" class="state-panel" aria-live="polite">正在读取实时会话…</div><div id="connections-content" hidden><div class="surface"><div class="surface-heading"><div class="heading-inline"><h2>账户在线情况</h2><span id="connections-total" class="number-badge">—</span></div><span id="connections-sampled" class="small-text muted"></span></div><div id="connections-list" class="connection-list"></div></div><p class="context-note"><svg class="icon" aria-hidden="true"><use href="#i-info"/></svg>多台设备可以共用一个账户或出口 IP，同一台设备也可以使用不同账户。此处按会话统计，设备名称和型号未知。</p></div></section>
+<section id="connections-page" class="page" aria-labelledby="connections-title" hidden>
+  <div class="page-heading connections-heading">
+    <div>
+      <p class="eyebrow">连接监控</p>
+      <h1 id="connections-title">实时会话</h1>
+      <p class="page-description">查看各账户的在线状态与当前 VPN 会话。</p>
+    </div>
+    <span class="connections-refresh">每 15 秒自动刷新</span>
+  </div>
+  <div id="connections-state" class="state-panel" role="status">正在读取实时会话…</div>
+  <div id="connections-content" hidden>
+    <dl class="connections-overview surface" aria-label="会话概况">
+      <div><dt>在线账户</dt><dd><strong id="connections-online">—</strong><span id="connections-account-total" class="connections-account-total"></span></dd></div>
+      <div><dt>活动会话</dt><dd><strong id="connections-total">—</strong></dd></div>
+      <div class="connections-sample"><dt>网关采样</dt><dd><time id="connections-sampled">—</time></dd></div>
+    </dl>
+    <div class="surface">
+      <div class="surface-heading connections-list-heading"><h2>账户连接</h2></div>
+      <div id="connections-list" class="connection-list"></div>
+    </div>
+    <p class="context-note"><svg class="icon" aria-hidden="true"><use href="#i-info"/></svg>多台设备可共用账户或出口 IP，会话数可能与实际设备数不同。</p>
+  </div>
+</section>
 <footer class="workspace-footer"><span>VPN Manager</span><span>账户 · 权限 · 访问记录</span></footer></main></div></div>
 <dialog id="user-dialog" aria-labelledby="user-dialog-title"><form id="user-form" method="dialog" novalidate>
 <div class="dialog-heading"><div><p class="eyebrow">账户与权限</p><h2 id="user-dialog-title">新建账户</h2></div><button id="close-user-dialog" class="icon-button" type="button" aria-label="关闭"><svg class="icon" aria-hidden="true"><use href="#i-close"/></svg></button></div>

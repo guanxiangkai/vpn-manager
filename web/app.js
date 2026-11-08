@@ -1,12 +1,15 @@
 const DEFAULT_AUDIT_LIMIT = 20;
-const state = { apiBaseUrl: "", sessionTransport: "cookie", sessionToken: null, csrfToken: null, user: null, users: [], usersSerial: 0, auditCursors: [null], auditIndex: 0, auditSerial: 0, connectionsSerial: 0, networks: [], networkNames: new Map(), networksSerial: 0, editingNetwork: null, userDialogSerial: 0, requestIds: new Map() };
+const CONNECTIONS_PATH = "/api/admin/vpn-connections";
+const CONNECTIONS_REFRESH_MS = 15_000;
+const CONNECTIONS_TIMEOUT_MS = 8_000;
+const state = { apiBaseUrl: "", sessionTransport: "cookie", sessionToken: null, csrfToken: null, user: null, users: [], usersSerial: 0, auditCursors: [null], auditIndex: 0, auditSerial: 0, connectionsSerial: 0, connectionsTimer: null, connectionsKey: null, networks: [], networkNames: new Map(), networksSerial: 0, editingNetwork: null, userDialogSerial: 0, requestIds: new Map() };
 
 const $ = (selector) => document.querySelector(selector);
 const elements = {
   loginView: $("#login-view"), appView: $("#app-view"), loginForm: $("#login-form"), loginSubmit: $("#login-submit"),
   loginError: $("#login-error"), serviceState: $("#service-state"), notice: $("#notice"), signedInUser: $("#signed-in-user"),
   logout: $("#logout-button"), profileState: $("#profile-state"), profileContent: $("#profile-content"), networkList: $("#network-list"),
-  usersState: $("#users-state"), usersContent: $("#users-content"), usersBody: $("#users-body"), auditState: $("#audit-state"), connectionsState: $("#connections-state"), connectionsContent: $("#connections-content"),
+  usersState: $("#users-state"), usersContent: $("#users-content"), usersBody: $("#users-body"), auditState: $("#audit-state"), connectionsPage: $("#connections-page"), connectionsState: $("#connections-state"), connectionsContent: $("#connections-content"),
   auditContent: $("#audit-content"), auditBody: $("#audit-body"), auditPrev: $("#audit-prev"), auditNext: $("#audit-next"), auditPageLabel: $("#audit-page-label"),
   userDialog: $("#user-dialog"), userForm: $("#user-form"), userFormError: $("#user-form-error"), managedUsername: $("#managed-username"),
   managedPassword: $("#managed-password"), editingUsername: $("#editing-username"), passwordHint: $("#password-hint"), userDialogTitle: $("#user-dialog-title"), saveUser: $("#save-user")
@@ -107,14 +110,25 @@ async function apiRequest(path, options = {}) {
   if (options.mutation && state.csrfToken) headers.set("X-CSRF-Token", state.csrfToken);
   if (state.sessionTransport === "bearer" && state.sessionToken) headers.set("Authorization", `Bearer ${state.sessionToken}`);
   let response;
+  let body = null;
+  let timedOut = false;
+  const timeout = options.timeoutMs && window.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, options.timeoutMs);
   try {
     response = await fetch(apiUrl(path), { method: options.method || "GET", credentials: state.sessionTransport === "bearer" ? "omit" : "include", cache: "no-store", redirect: "error", headers, body: options.body === undefined ? undefined : JSON.stringify(options.body), signal: controller.signal });
+    try { body = await response.json(); } catch (error) {
+      if (controller.signal.aborted) throw error;
+    }
   } catch (error) {
-    if (error.name === "AbortError") throw error;
+    if (timedOut) throw new Error("请求超时。");
+    if (controller.signal.aborted) throw error;
     throw new Error("网络请求失败，请检查服务地址和网络连接。");
-  } finally { if (state.requestIds.get(path) === controller) state.requestIds.delete(path); }
-  let body = null;
-  try { body = await response.json(); } catch { /* 非 JSON 错误响应由下方统一处理。 */ }
+  } finally {
+    window.clearTimeout(timeout);
+    if (state.requestIds.get(path) === controller) state.requestIds.delete(path);
+  }
   if (!response.ok) {
     const detail = body?.error;
     const error = new Error(detail?.message || `请求失败（HTTP ${response.status}）`);
@@ -195,7 +209,11 @@ async function loadVpnStatus(user) {
 function showLogin() {
   document.title = "登录 · VPN 管理器";
   // 会话切换必须使仍在飞行的旧账户读取结果过期，避免其覆盖新账户页面。
-  state.usersSerial += 1; state.auditSerial += 1; state.networksSerial += 1; state.connectionsSerial += 1; state.userDialogSerial += 1;
+  state.usersSerial += 1; state.auditSerial += 1; state.networksSerial += 1; state.userDialogSerial += 1;
+  stopConnections();
+  state.connectionsKey = null;
+  elements.connectionsContent.hidden = true;
+  $("#connections-list").replaceChildren();
   state.users = []; state.auditCursors = [null]; state.auditIndex = 0;
   $("#user-search").value = ""; $("#user-status-filter").value = "all";
   state.networks = []; state.networkNames.clear(); state.editingNetwork = null; $("#network-search").value = "";
@@ -262,7 +280,8 @@ function showPage(page) {
   document.title = `${title} · VPN 管理器`;
   $("#main-content").focus({ preventScroll: true });
   window.scrollTo({ top: 0, behavior: "instant" });
-  if (page === "users") loadUsers(); if (page === "audit") loadAudit(); if (page === "connections") loadConnections();
+  if (page === "users") loadUsers(); if (page === "audit") loadAudit();
+  syncConnections();
   if (page === "networks") loadNetworks();
 }
 
@@ -341,46 +360,109 @@ async function submitNetwork(event) {
   } finally { setBusy($("#save-network"), false, ""); }
 }
 
+function connectionDate(date) {
+  return date.toLocaleString("zh-CN", { hour12: false });
+}
+
 function renderConnections(accounts) {
-  const list = $("#connections-list");
-  list.replaceChildren();
+  const rows = document.createDocumentFragment();
+  const online = accounts.filter(({ sessions }) => sessions.length);
+  const offline = accounts.filter(({ sessions }) => !sessions.length);
   let total = 0;
-  for (const { username, sessions } of accounts) {
+
+  for (const { username, sessions } of [...online, ...offline]) {
     total += sessions.length;
-    const card = textElement("article", "", "connection-card");
-    const heading = textElement("div", "", "connection-card-heading");
-    heading.append(textElement("strong", username), statusBadge(sessions.length ? "在线" : "离线", sessions.length ? "active" : "inactive"));
-    card.append(heading, textElement("p", `会话数 ${sessions.length}`, "connection-count"));
-    for (const session of sessions) {
-      const detail = textElement("div", "", "connection-detail");
-      const { remote_address: address, remote_port: port } = session;
-      const host = address?.includes(":") && port ? `[${address}]` : address;
-      const endpoint = host && port ? `${host}:${port}` : host;
-      const connected = session.connected_at ? new Date(session.connected_at).toLocaleString("zh-CN", { hour12: false }) : "未知";
-      detail.append(
-        textElement("span", `会话 ${session.session_id}`),
-        textElement("span", `来源 ${endpoint || "未知"}`),
-        textElement("span", `VPN 地址 ${session.virtual_addresses.join(", ") || "未知"}`),
-        textElement("span", `建立时间 ${connected}`),
-      );
-      card.append(detail);
+    const row = textElement("article", "", "connection-account");
+    const heading = textElement("div", "", "connection-account-heading");
+    const identity = textElement("div", "", "connection-identity");
+    identity.append(textElement("h3", username), statusBadge(sessions.length ? "在线" : "离线", sessions.length ? "active" : "inactive"));
+    heading.append(identity, textElement("span", `${sessions.length} 条会话`, "connection-count"));
+    row.append(heading);
+
+    if (sessions.length) {
+      const details = textElement("div", "", "connection-sessions");
+      for (const session of sessions) {
+        const { remote_address: address, remote_port: port } = session;
+        const host = address?.includes(":") && port ? `[${address}]` : address;
+        const endpoint = host && port ? `${host}:${port}` : host;
+        const connected = session.connected_at ? connectionDate(new Date(session.connected_at)) : "—";
+        const detail = textElement("dl", "", "connection-detail");
+        for (const [label, value, monospace] of [
+          ["会话编号", `#${session.session_id}`, true],
+          ["来源地址", endpoint || "—", true],
+          ["VPN 地址", session.virtual_addresses.join("、") || "—", true],
+          ["建立时间", connected, false],
+        ]) {
+          const field = document.createElement("div");
+          field.append(textElement("dt", label), textElement("dd", value, monospace ? "connection-address" : ""));
+          detail.append(field);
+        }
+        details.append(detail);
+      }
+      row.append(details);
     }
-    list.append(card);
+    rows.append(row);
   }
-  if (!list.children.length) list.append(textElement("p", "暂无管理账户。", "state-panel"));
-  $("#connections-total").textContent = `会话数 ${total}`;
+
+  if (!accounts.length) rows.append(textElement("p", "暂无管理账户。", "state-panel"));
+  $("#connections-list").replaceChildren(rows);
+  $("#connections-online").textContent = online.length;
+  $("#connections-account-total").textContent = `/ ${accounts.length}`;
+  $("#connections-total").textContent = total;
+}
+
+function connectionsVisible() {
+  return state.user?.role === "admin" && !elements.connectionsPage.hidden && !document.hidden;
+}
+
+function stopConnections() {
+  window.clearTimeout(state.connectionsTimer);
+  state.connectionsSerial += 1;
+  state.requestIds.get(CONNECTIONS_PATH)?.abort();
+}
+
+function syncConnections() {
+  stopConnections();
+  if (!connectionsVisible()) return;
+  elements.connectionsContent.hidden = true;
+  setPanel(elements.connectionsState, "", "正在读取实时会话…");
+  void loadConnections();
 }
 
 async function loadConnections() {
-  if (state.user?.role !== "admin") return;
-  elements.connectionsContent.hidden = true; setPanel(elements.connectionsState, "", "正在读取实时会话…"); const serial = ++state.connectionsSerial;
+  if (!connectionsVisible()) return;
+  const serial = state.connectionsSerial;
+  const started = performance.now();
   try {
-    const result = await apiRequest("/api/admin/vpn-connections"); if (serial !== state.connectionsSerial || state.user?.role !== "admin") return;
-    renderConnections(result.accounts); const sampled = new Date(result.sampled_at); $("#connections-sampled").textContent = Number.isNaN(sampled.valueOf()) ? "采样时间未知" : `采样于 ${sampled.toLocaleString("zh-CN", { hour12: false })}`;
-    elements.connectionsState.hidden = true; elements.connectionsContent.hidden = false;
+    const result = await apiRequest(CONNECTIONS_PATH, { timeoutMs: CONNECTIONS_TIMEOUT_MS });
+    if (serial !== state.connectionsSerial) return;
+    const accounts = expectArray(result?.accounts, "会话数据");
+    const sampled = new Date(result.sampled_at);
+    if (typeof result.sampled_at !== "string" || Number.isNaN(sampled.valueOf())) throw protocolError("采样时间");
+
+    const key = JSON.stringify(accounts);
+    if (key !== state.connectionsKey) {
+      renderConnections(accounts);
+      state.connectionsKey = key;
+    }
+    const sampleTime = $("#connections-sampled");
+    sampleTime.dateTime = result.sampled_at;
+    sampleTime.textContent = connectionDate(sampled);
+    elements.connectionsState.hidden = true;
+    elements.connectionsContent.hidden = false;
   } catch (error) {
-    if (serial !== state.connectionsSerial || error.name === "AbortError") return; if (isSessionError(error)) { showLogin(); return; }
-    setPanel(elements.connectionsState, "error", error.code === "gateway_unavailable" || error.status === 503 ? "网关暂不可用，在线状态未知。请稍后重试。" : `无法读取实时会话：${humanError(error)}`);
+    if (serial !== state.connectionsSerial || error.name === "AbortError") return;
+    if (isSessionError(error)) { showLogin(); return; }
+    elements.connectionsContent.hidden = true;
+    const message = error.status === 403 ? "需要管理员权限才能查看会话。" : "当前在线状态未知，系统将自动重试。";
+    if (elements.connectionsState.hidden || elements.connectionsState.textContent !== message) {
+      setPanel(elements.connectionsState, "error", message);
+    }
+  } finally {
+    if (serial === state.connectionsSerial && connectionsVisible()) {
+      const delay = Math.max(0, CONNECTIONS_REFRESH_MS - (performance.now() - started));
+      state.connectionsTimer = window.setTimeout(loadConnections, delay);
+    }
   }
 }
 
@@ -551,7 +633,9 @@ async function logout() {
 elements.loginForm.addEventListener("submit", submitLogin);
 elements.logout.addEventListener("click", logout);
 document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("click", () => showPage(item.dataset.page)));
-$("#refresh-connections").addEventListener("click", loadConnections);
+document.addEventListener("visibilitychange", () => {
+  if (!elements.connectionsPage.hidden) syncConnections();
+});
 $("#user-search").addEventListener("input", renderUsers);
 $("#user-status-filter").addEventListener("change", renderUsers);
 $("#refresh-users").addEventListener("click", loadUsers);
