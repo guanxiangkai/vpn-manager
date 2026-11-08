@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse
 from starlette.staticfiles import StaticFiles
 
 from .gateway_sync import GatewayClient, GatewayUnavailable, seal_credential
-from .models import AuditPage, DeviceCreate, DeviceView, ErrorResponse, GatewayStatus, LoginRequest, LoginResponse, MeResponse, MessageResponse, NetworkCreate, NetworkUpdate, NetworkView, UserCreate, UserUpdate, UserView
+from .models import AuditPage, DeviceCreate, DeviceCredential, DeviceView, ErrorResponse, GatewayStatus, LoginRequest, LoginResponse, MeResponse, MessageResponse, NetworkCreate, NetworkUpdate, NetworkView, UserCreate, UserUpdate, UserView
 from .security import COOKIE_NAME, SESSION_TTL, hash_password, needs_rehash, new_secret, token_hash, utc_now, utc_text, verify_password
 from .store import DeviceConflict, DeviceQuotaExceeded, Store
 
@@ -137,7 +137,8 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
     async def database_unavailable(_,__):
         return JSONResponse({"error":{"code":"service_unavailable","message":"服务暂不可用，请稍后重试。"}},status_code=503)
 
-    def queue_gateway_change(connection: Any, username: str, active: bool, networks: list[str], password: str | None) -> None:
+    def queue_gateway_change(connection: Any, username: str, active: bool, networks: list[str],
+                             password: str | None, *, discard_pending_credential: bool = False) -> None:
         """仅已投影账户或显式重设密码可入队，避免为历史账户伪造 VPN 状态。"""
         if gateway_public_key is None:
             return
@@ -146,8 +147,43 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
             return
         generation = store.next_gateway_generation(connection, username)
         envelope = seal_credential(gateway_public_key, username, generation, password) if password is not None else None
-        store.queue_gateway_change(connection, username, generation, active, networks, envelope)
+        store.queue_gateway_change(connection, username, generation, active, networks, envelope,
+                                   discard_pending_credential=discard_pending_credential)
         store.audit(connection, actor=None, source_ip=None, action="gateway_sync_queued", target=username, outcome="success")
+
+    def queue_device_grants(connection: Any, username: str, active: bool, networks: list[str]) -> None:
+        for identity in store.enabled_device_identities(connection, username):
+            queue_gateway_change(connection, identity, active, networks if active else [], None)
+
+    def device_views(account_id: str) -> list[dict]:
+        rows = store.list_device_access(account_id)
+        identities = [row["vpn_username"] for row in rows
+                      if row["vpn_username"] and not (row["disabled"] and row["gateway_state"] == "applied")]
+        online = None
+        if gateway_client is not None and identities:
+            try:
+                online = gateway_client.connected_identities(identities)
+            except GatewayUnavailable:
+                pass
+        return [device_view(row, online) for row in rows]
+
+    def device_view(row: dict, online: set[str] | None) -> dict:
+        identity, state = row["vpn_username"], row["gateway_state"]
+        connection_state = "unknown"
+        if identity is None:
+            vpn_state = "unmanaged"
+        elif state in {"failed", "superseded", None}:
+            vpn_state = "unavailable"
+        elif state != "applied" or row["applied_generation"] != row["generation"]:
+            vpn_state = "disabling" if row["disabled"] or not row["account_active"] else "provisioning"
+        elif row["disabled"] or not row["account_active"]:
+            vpn_state, connection_state = "disabled", "offline"
+        else:
+            vpn_state = "enabled"
+            if online is not None:
+                connection_state = "online" if identity in online else "offline"
+        return {**{key: row[key] for key in ("account_id", "device_id", "state", "created_at", "updated_at")},
+                "vpn_state": vpn_state, "connection_state": connection_state}
 
     def live_gateway_status(username: str) -> dict[str, Any]:
         """将数据库的当前期望与代理的实际状态合并，绝不以旧 ACK 冒充已生效。"""
@@ -304,13 +340,13 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
 
     @app.get("/api/devices",response_model=list[DeviceView])
     def own_devices(user: Annotated[dict,Depends(current_user)]):
-        return store.list_devices(user["username"])
+        return device_views(user["username"])
 
     @app.post("/api/devices/{device_id}/remove",response_model=DeviceView)
     def remove_own_device(device_id: str,request: Request,user: Annotated[dict,Depends(csrf_protected)]):
         with store.write_transaction() as connection:
             user = authorize_write(connection, request)
-            item = store.remove_device_in_transaction(connection,user["username"],device_id,user["username"],source_ip(request))
+            item = remove_device_record(connection, user["username"], device_id, user["username"], request)
         if item is None:
             raise ApiError(404,"device_not_found","未找到设备记录。")
         return item
@@ -358,6 +394,8 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
 
     @app.post("/api/admin/users", response_model=UserView, status_code=201, responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}, 409: {"model": ErrorResponse}})
     def create_user(payload: UserCreate, request: Request, actor: Annotated[dict[str, Any], Depends(admin_mutation_user)]) -> dict[str, Any]:
+        if payload.username.startswith("device-"):
+            raise ApiError(422, "invalid_username", "此用户名由 VPN 设备管理保留。")
         password = payload.password.get_secret_value()
         password_hash = hash_password(password)
         with store.write_transaction() as connection:
@@ -416,6 +454,8 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
                     connection.execute("DELETE FROM user_networks WHERE username = ?", (username,))
                     connection.executemany("INSERT INTO user_networks(username, network) VALUES (?, ?)", [(username, network) for network in next_networks])
                 store.revoke_sessions(connection, username)
+                if next_active != current["active"] or next_networks != current["networks"]:
+                    queue_device_grants(connection, username, next_active, next_networks)
                 if vpn_changed:
                     queue_gateway_change(connection, username, next_active, next_networks, password)
             store.audit(connection, actor=actor["username"], source_ip=source_ip(request), action="user_update", target=username, outcome="success")
@@ -433,6 +473,7 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
             if current["active"]:
                 connection.execute("UPDATE users SET active = 0, updated_at = ? WHERE username = ?", (utc_text(), username))
                 store.revoke_sessions(connection, username)
+                queue_device_grants(connection, username, False, [])
                 queue_gateway_change(connection, username, False, [], None)
             store.audit(connection, actor=actor["username"], source_ip=source_ip(request), action="user_deactivate", target=username, outcome="success")
             updated = store.user_from_row(connection, connection.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone())
@@ -442,7 +483,7 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
     def user_devices(username: str,_: Annotated[dict,Depends(admin_user)]):
         if store.find_user(username) is None:
             raise ApiError(404,"user_not_found","未找到账户。")
-        return store.list_devices(username)
+        return device_views(username)
 
     @app.post("/api/admin/users/{username}/devices",response_model=DeviceView,status_code=201)
     def add_device(username: str,payload: DeviceCreate,request: Request,actor: Annotated[dict,Depends(admin_mutation_user)]):
@@ -459,10 +500,76 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
     def remove_device(username: str,device_id: str,request: Request,actor: Annotated[dict,Depends(admin_mutation_user)]):
         with store.write_transaction() as connection:
             actor = authorize_write(connection, request, admin=True)
-            item = store.remove_device_in_transaction(connection,username,device_id,actor["username"],source_ip(request))
+            item = remove_device_record(connection, username, device_id, actor["username"], request)
         if item is None:
             raise ApiError(404,"device_not_found","未找到设备记录。")
         return item
+
+    def remove_device_record(connection, username: str, device_id: str, actor: str, request: Request):
+        try:
+            return store.remove_device_in_transaction(connection, username, device_id, actor, source_ip(request))
+        except DeviceConflict:
+            raise ApiError(409, "device_disable_required", "请先禁用此设备的 VPN 凭据，并等待网关确认。")
+
+    @app.post("/api/admin/users/{username}/devices/{device_id}/provision",
+              response_model=DeviceCredential, status_code=201)
+    def provision_device(username: str, device_id: str, request: Request,
+                         actor: Annotated[dict, Depends(admin_mutation_user)]):
+        if gateway_public_key is None or gateway_client is None:
+            raise ApiError(503, "gateway_unavailable", "VPN 网关暂不可用。")
+        if store.find_user(username) is None:
+            raise ApiError(404, "user_not_found", "未找到账户。")
+        try:
+            gateway_client.connected_identities([username])
+        except GatewayUnavailable:
+            raise ApiError(503, "gateway_unavailable", "VPN 网关暂不可用。")
+        password = new_secret()
+        with store.write_transaction() as connection:
+            actor = authorize_write(connection, request, admin=True)
+            account = store.user_from_row(connection, connection.execute(
+                "SELECT * FROM users WHERE username=?", (username,)).fetchone())
+            record = connection.execute("SELECT state FROM device_records WHERE account_id=? AND device_id=?",
+                                        (username, device_id)).fetchone()
+            if record is None or record["state"] != "registered":
+                raise ApiError(404, "device_not_found", "未找到已登记的设备。")
+            if not account["active"]:
+                raise ApiError(409, "device_conflict", "请先启用所属账户。")
+            identity = store.device_identity(connection, username, device_id)
+            if identity is None:
+                vpn_username = "device-" + uuid.uuid4().hex
+                connection.execute("INSERT INTO gateway_identities(username,account_id,device_id) VALUES (?,?,?)",
+                                   (vpn_username, username, device_id))
+            else:
+                if not identity["disabled"] or identity["gateway_state"] != "applied":
+                    raise ApiError(409, "device_conflict", "设备已有凭据，请先禁用并等待网关确认。")
+                vpn_username = identity["username"]
+                connection.execute("UPDATE gateway_identities SET disabled=0 WHERE username=?", (vpn_username,))
+            queue_gateway_change(connection, vpn_username, True, account["networks"], password)
+            connection.execute("UPDATE device_records SET updated_at=? WHERE account_id=? AND device_id=?",
+                               (utc_text(), username, device_id))
+            store.audit(connection, actor=actor["username"], source_ip=source_ip(request),
+                        action="device_vpn_provision", target=f"{username}:{device_id}", outcome="success")
+        return {"username": vpn_username, "password": password}
+
+    @app.post("/api/admin/users/{username}/devices/{device_id}/disable", response_model=DeviceView)
+    def disable_device(username: str, device_id: str, request: Request,
+                       actor: Annotated[dict, Depends(admin_mutation_user)]):
+        if gateway_public_key is None:
+            raise ApiError(503, "gateway_unavailable", "VPN 网关暂不可用。")
+        with store.write_transaction() as connection:
+            actor = authorize_write(connection, request, admin=True)
+            identity = store.device_identity(connection, username, device_id)
+            if identity is None:
+                raise ApiError(409, "device_not_managed", "此设备尚未使用独立 VPN 凭据。")
+            if not identity["disabled"] or identity["gateway_state"] == "failed":
+                vpn_username = identity["username"]
+                connection.execute("UPDATE gateway_identities SET disabled=1 WHERE username=?", (vpn_username,))
+                queue_gateway_change(connection, vpn_username, False, [], None, discard_pending_credential=True)
+                connection.execute("UPDATE device_records SET updated_at=? WHERE account_id=? AND device_id=?",
+                                   (utc_text(), username, device_id))
+                store.audit(connection, actor=actor["username"], source_ip=source_ip(request),
+                            action="device_vpn_disable", target=f"{username}:{device_id}", outcome="success")
+        return next(row for row in device_views(username) if row["device_id"] == device_id)
 
     @app.get("/api/admin/audit",response_model=AuditPage)
     def audit_log(_: Annotated[dict,Depends(admin_user)],cursor: int | None = Query(default=None,ge=1),limit: int = Query(default=50,ge=1,le=100)):

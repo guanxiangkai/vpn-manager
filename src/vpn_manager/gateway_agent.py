@@ -88,11 +88,22 @@ def nt_credential(password: str) -> str:
 
 
 def check_request(request: object) -> dict[str, Any]:
-    if not isinstance(request, dict) or request.get("action") not in {"status", "apply_account", "reload_certificate"}:
+    if not isinstance(request, dict) or request.get("action") not in {"status", "connections", "apply_account", "reload_certificate"}:
         raise ProjectionError("invalid_request")
     if request["action"] == "reload_certificate":
         if set(request) != {"action"}:
             raise ProjectionError("invalid_request")
+        return request
+    if request["action"] == "connections":
+        usernames = request.get("usernames")
+        if (set(request) != {"action", "usernames"} or not isinstance(usernames, list)
+                or not usernames or len(usernames) > 1024
+                or any(not isinstance(username, str) for username in usernames)
+                or len(usernames) != len(set(usernames))):
+            raise ProjectionError("invalid_request")
+        for username in usernames:
+            if not isinstance(username, str) or re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", username) is None:
+                raise ProjectionError("invalid_request")
         return request
     username = request.get("username")
     if not isinstance(username, str) or re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", username) is None:
@@ -167,6 +178,49 @@ class ViciDriver:
                     list(session.terminate({"ike-id": value["uniqueid"], "timeout": "1500", "force": "yes"}))
             if any(name in item for item in session.list_sas({"ike": name})):
                 raise ProjectionError("account_sa_remains")
+
+    @staticmethod
+    def _text(value: object) -> str | None:
+        if isinstance(value, bytes):
+            try:
+                return value.decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+        return value if isinstance(value, str) else None
+
+    @classmethod
+    def _has_installed_child(cls, value: object, child_name: str) -> bool:
+        if not isinstance(value, dict):
+            return False
+        children = value.get("child-sas", value.get(b"child-sas"))
+        if not isinstance(children, dict):
+            return False
+        for key, child in children.items():
+            if not isinstance(child, dict):
+                continue
+            name = cls._text(child.get("name", child.get(b"name"))) or cls._text(key)
+            state = cls._text(child.get("state", child.get(b"state")))
+            if name == child_name and state == "INSTALLED":
+                return True
+        return False
+
+    def connected_identities(self, usernames: list[str]) -> set[str]:
+        names = {self.name(username): username for username in usernames}
+        found: set[str] = set()
+        with self.session() as session:
+            for item in session.list_sas():
+                for ike, details in item.items():
+                    configured = names.get(self._text(ike))
+                    if configured is None:
+                        continue
+                    ike_state = self._text(details.get("state"))
+                    if ike_state not in {"ESTABLISHED", "REKEYING"}:
+                        continue
+                    # VICI 6.1.0 omits remote-eap-id when it equals remote-id.
+                    identity = self._text(details.get("remote-eap-id", details.get("remote-id")))
+                    if identity == configured and self._has_installed_child(details, self.name(configured) + "-net"):
+                        found.add(configured)
+        return found
 
     def load(self, username: str, account: dict[str, Any]) -> None:
         name = self.name(username)
@@ -341,6 +395,11 @@ class GatewayAgent:
             result["code"] = account["code"]
         return result
 
+    def connections(self, usernames: list[str]) -> dict[str, Any]:
+        usernames = list(usernames)
+        online = self.driver.connected_identities(usernames)
+        return {"usernames": sorted(online)}
+
     def apply(self, request: dict[str, Any]) -> dict[str, Any]:
         request = check_request(request)
         if request["action"] == "reload_certificate":
@@ -352,6 +411,8 @@ class GatewayAgent:
                     self.driver.load(username, account)
                     count += 1
             return {"state": "certificate_reloaded", "accounts": count}
+        if request["action"] == "connections":
+            return self.connections(request["usernames"])
         username = request["username"]
         if request["action"] == "status":
             return self.status(username)

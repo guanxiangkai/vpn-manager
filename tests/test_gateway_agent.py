@@ -151,3 +151,32 @@ def test_projection_failure_stays_isolated_pending_and_same_request_retries(agen
         ("load", "adminone", ("home",)),
         ("isolate", ()),
     ]
+
+
+def test_vici_connections_requires_authenticated_identity_and_installed_child(monkeypatch):
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def list_sas(self):
+            def sa(username, ike_state, child_state, **identity):
+                child = f"account-{username}-net"
+                return {f"account-{username}": {"state": ike_state, **identity,
+                        "child-sas": {f"{child}-17": {"name": child, "state": child_state}}}}
+
+            return [
+                sa("device-a", b"ESTABLISHED", b"INSTALLED", **{"remote-eap-id": b"device-a", "remote-id": b"mac"}),
+                sa("device-b", b"ESTABLISHED", b"REKEYING", **{"remote-eap-id": b"device-b"}),
+                sa("device-c", b"CONNECTING", b"INSTALLED", **{"remote-id": b"device-c"}),
+                sa("device-d", b"ESTABLISHED", b"INSTALLED", **{"remote-eap-id": b"device-a", "remote-id": b"device-d"}),
+                sa("device-e", b"ESTABLISHED", b"INSTALLED", **{"remote-id": b"device-e"}),
+            ]
+
+    driver = gateway_agent.ViciDriver({})
+    monkeypatch.setattr(driver, "session", lambda: Session())
+    assert driver.connected_identities(["device-a", "device-b", "device-c", "device-d", "device-e"]) == {
+        "device-a", "device-e",
+    }

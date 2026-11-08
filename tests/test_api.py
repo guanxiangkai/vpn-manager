@@ -465,3 +465,121 @@ def test_body_limit_static_headers_and_unconnected_gateway(database):
     response=client.get('/api/vpn/status')
     assert response.status_code==503 and response.json()['error']['code']=='gateway_unavailable'
     assert client.get('/api/admin/gateway-status').status_code==503
+
+
+def test_device_credentials_only_disable_the_selected_identity(database):
+    from vpn_manager.gateway_sync import GatewayUnavailable
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    class Gateway:
+        online = set()
+        reachable = True
+
+        def connected_identities(self, usernames):
+            if not self.reachable:
+                raise GatewayUnavailable()
+            return self.online.intersection(usernames)
+
+    gateway = Gateway()
+    key = X25519PrivateKey.generate()
+    public_key = key.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+    client = TestClient(create_app(database, gateway_public_key=public_key, gateway_client=gateway),
+                        base_url=ALLOWED_ORIGIN, client=("192.0.2.10", 12345))
+    member = client_for(database, "192.0.2.11")
+    admin_headers = csrf(login(client))
+    member_headers = csrf(login(member, "member", "correct-horse-member"))
+    store = Store(database)
+    path = "/api/admin/users/member/devices"
+
+    def acknowledge(job):
+        store.record_gateway_reply(job["operation_id"], job["username"], job["generation"], "applied", None)
+
+    for device in ("mac", "windows", "shared"):
+        assert client.post(path, headers=admin_headers, json={"device_id": device}).status_code == 201
+    assert member.post(path + "/mac/provision", headers=member_headers).status_code == 403
+    identities = {}
+    for device in ("mac", "windows"):
+        response = client.post(f"{path}/{device}/provision", headers=admin_headers)
+        assert response.status_code == 201, response.text
+        assert response.headers["cache-control"] == "no-store"
+        result = response.json()
+        identities[device] = result["username"]
+        job = next(job for job in store.pending_gateway_jobs() if job["username"] == result["username"])
+        assert job["networks"] == ["work"]
+        assert job["credential_envelope"] is not None
+        assert result["password"] not in str(job)
+        acknowledge(job)
+    assert identities["mac"] != identities["windows"]
+    assert client.post(path + "/mac/provision", headers=admin_headers).status_code == 409
+    assert client.post(path + "/shared/disable", headers=admin_headers).status_code == 409
+    assert member.post("/api/devices/mac/remove", headers=member_headers).status_code == 409
+
+    gateway.online = {identities["mac"], identities["windows"], "member"}
+    states = {row["device_id"]: row for row in client.get(path).json()}
+    assert states["mac"]["connection_state"] == "online"
+    assert states["windows"]["connection_state"] == "online"
+    assert states["shared"]["vpn_state"] == "unmanaged"
+    assert states["shared"]["connection_state"] == "unknown"
+    gateway.reachable = False
+    assert client.get(path).json()[0]["connection_state"] == "unknown"
+    gateway.reachable = True
+
+    response = client.post(path + "/mac/disable", headers=admin_headers)
+    assert response.status_code == 200
+    assert response.json()["vpn_state"] == "disabling"
+    [job] = store.pending_gateway_jobs()
+    assert job["username"] == identities["mac"]
+    assert job["active"] is False and job["networks"] == []
+    assert client.post(path + "/mac/disable", headers=admin_headers).status_code == 200
+    assert [item["operation_id"] for item in store.pending_gateway_jobs()] == [job["operation_id"]]
+    acknowledge(job)
+    gateway.online.remove(identities["mac"])
+    states = {row["device_id"]: row for row in client.get(path).json()}
+    assert states["mac"]["vpn_state"] == "disabled"
+    assert states["mac"]["connection_state"] == "offline"
+    assert states["windows"]["connection_state"] == "online"
+    assert member.get("/api/auth/me").status_code == 200
+
+    assert client.patch("/api/admin/users/member", headers=admin_headers,
+                        json={"role": "admin", "networks": ["home", "work"]}).status_code == 200
+    [job] = store.pending_gateway_jobs()
+    assert job["username"] == identities["windows"]
+    assert job["networks"] == ["home", "work"]
+    acknowledge(job)
+    assert client.post("/api/admin/users/member/deactivate", headers=admin_headers).status_code == 200
+    [job] = store.pending_gateway_jobs()
+    assert job["username"] == identities["windows"] and job["active"] is False
+    acknowledge(job)
+    states = {row["device_id"]: row for row in client.get(path).json()}
+    assert states["windows"]["vpn_state"] == "disabled"
+    assert client.post(path + "/mac/provision", headers=admin_headers).status_code == 409
+
+
+def test_device_schema_preserves_existing_gateway_queue(database):
+    store = Store(database)
+    with store.write_transaction() as connection:
+        connection.execute("DROP TABLE gateway_outbox")
+        connection.execute("DROP TABLE gateway_accounts")
+        connection.execute("DROP TABLE gateway_identities")
+        connection.execute("""CREATE TABLE gateway_accounts (
+            username TEXT PRIMARY KEY REFERENCES users(username) ON DELETE CASCADE, generation INTEGER,
+            applied_generation INTEGER, state TEXT, code TEXT, updated_at TEXT)""")
+        connection.execute("""CREATE TABLE gateway_outbox (
+            operation_id TEXT PRIMARY KEY, username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+            generation INTEGER, active INTEGER, networks_json TEXT, credential_envelope TEXT,
+            state TEXT, code TEXT, created_at TEXT, updated_at TEXT)""")
+        connection.execute("CREATE INDEX gateway_outbox_pending_idx ON gateway_outbox(state,created_at)")
+        now = utc_text()
+        connection.execute("INSERT INTO gateway_accounts VALUES ('member',2,1,'queued',NULL,?)", (now,))
+        connection.execute("INSERT INTO gateway_outbox VALUES (?,?,?,?,?,?,?,?,?,?)",
+                           ("previous", "member", 2, 1, '["work"]', '{"version":1}', "queued", None, now, now))
+        connection.execute("UPDATE schema_metadata SET value='7' WHERE key='schema_version'")
+    store.initialize()
+    store.initialize()
+    assert store.gateway_status("member")["applied_generation"] == 1
+    [job] = store.pending_gateway_jobs()
+    assert job["operation_id"] == "previous"
+    assert job["credential_envelope"] == {"version": 1}
+    with store.connect() as connection:
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []

@@ -93,6 +93,13 @@ class DeviceView(StrictModel):
     state: Literal["registered", "removed"]
     created_at: datetime
     updated_at: datetime
+    vpn_state: Literal["unmanaged", "provisioning", "enabled", "disabling", "disabled", "unavailable"] = "unmanaged"
+    connection_state: Literal["online", "offline", "unknown"] = "unknown"
+
+
+class DeviceCredential(StrictModel):
+    username: str
+    password: str
 
 
 class GatewayStatus(StrictModel):

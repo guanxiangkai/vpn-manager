@@ -23,7 +23,34 @@ function roleText(role, protectedAccount = false) { return protectedAccount ? "�
 function networkInfo(network) { return state.networkNames.get(network); }
 function networkText(network) { return networkInfo(network)?.name || network; }
 function networkIcon(network) { return ["home", "work"].includes(network) ? network : "network"; }
-function deviceStateText(value) { return ({ registered: "已登记", removed: "已移除" })[value] || value; }
+function deviceStateText(value) { return ({ registered: "已登记", removed: "已移除", connecting: "正在连接", pending: "正在连接", connected: "已连接", online: "已连接", disconnected: "未连接", offline: "未连接", unavailable: "状态暂不可用", unknown: "状态暂不可用", disabled: "已禁用", revoked: "已禁用" })[value] || value || "状态暂不可用"; }
+function vpnStateText(value) { return ({ unmanaged: "未绑定", provisioning: "正在配置", enabled: "已启用", disabling: "正在禁用", disabled: "已禁用", unavailable: "状态暂不可用" })[value] || "未绑定"; }
+function deviceConnectionState(device) {
+  // Newer APIs expose connection_state/status; legacy records remain registration-only.
+  return device.connection_state || device.connectionStatus || device.status || (device.disabled ? "disabled" : null) || null;
+}
+function deviceManaged(device) { return device.managed === true || device.credential_managed === true || device.credential_state != null; }
+function deviceBadge(device) {
+  const value = deviceConnectionState(device);
+  if (!value) return statusBadge(deviceStateText(device.state), device.state === "registered" ? "active" : "inactive");
+  const type = value === "connected" || value === "online" ? "active" : value === "disabled" || value === "revoked" ? "inactive" : "pending";
+  return statusBadge(deviceStateText(value), type);
+}
+function deviceStateCell(device) {
+  const cell = document.createElement("div");
+  if (device.vpn_state) cell.append(statusBadge(vpnStateText(device.vpn_state), device.vpn_state === "enabled" ? "active" : device.vpn_state === "disabled" ? "inactive" : "pending"));
+  if (deviceConnectionState(device)) cell.append(statusBadge(deviceStateText(deviceConnectionState(device)), deviceConnectionState(device) === "online" ? "active" : "pending"));
+  if (!cell.childNodes.length) cell.append(deviceBadge(device));
+  return cell;
+}
+function showProvisionedCredential(credential) {
+  const dialog = document.createElement("dialog"); const form = document.createElement("form"); form.method = "dialog"; form.className = "dialog-body";
+  form.append(textElement("h2", "设备凭据（仅显示一次）"), textElement("p", "请立即复制并安全保存。关闭后不会再次显示密码。", "muted"));
+  form.append(textElement("p", "账户名：" + (credential.username || "—")), textElement("p", "密码：" + (credential.password || "—"), "credential-secret"), textElement("p", "网页不会将凭据写入本地存储或缓存。", "field-hint"));
+  const close = document.createElement("button"); close.type = "submit"; close.className = "button primary"; close.textContent = "完成"; form.append(close); dialog.append(form); document.body.append(dialog); dialog.addEventListener("close", () => dialog.remove(), { once: true }); dialog.showModal();
+}
+async function provisionDevice(account, device, button) { setBusy(button, true, "配置中…"); try { const path = "/api/admin/users/" + encodeURIComponent(account) + "/devices/" + encodeURIComponent(device.device_id) + "/provision"; const credential = await apiRequest(path, { method: "POST", body: {}, mutation: true }); if (!credential || typeof credential.username !== "string" || typeof credential.password !== "string") throw protocolError("设备凭据"); showProvisionedCredential(credential); await loadDevices(account); } catch (error) { showNotice("无法配置设备：" + humanError(error)); } finally { setBusy(button, false, "配置设备"); } }
+async function disableDevice(account, device, button) { if (!window.confirm("确定禁用设备“" + device.device_id + "”吗？这只影响该设备凭据，不影响账户密码登录。")) return; setBusy(button, true, "禁用中…"); try { const path = "/api/admin/users/" + encodeURIComponent(account) + "/devices/" + encodeURIComponent(device.device_id) + "/disable"; await apiRequest(path, { method: "POST", body: {}, mutation: true }); showNotice("设备凭据已禁用。"); await loadDevices(account); } catch (error) { showNotice("无法禁用设备：" + humanError(error)); } finally { setBusy(button, false, "禁用设备"); } }
 function humanError(error) {
   return error.message;
 }
@@ -493,7 +520,7 @@ async function loadOwnDevices() {
 function renderOwnDevices(devices) {
   elements.ownDevicesBody.replaceChildren();
   if (devices.length === 0) { emptyRow(elements.ownDevicesBody, 3, "还没有设备记录", "需要登记时，请联系管理员维护名单。"); return; }
-  devices.forEach((device) => { const row = document.createElement("tr"); const id = document.createElement("td"); id.textContent = device.device_id; row.append(id); const stateCell = document.createElement("td"); stateCell.append(statusBadge(deviceStateText(device.state), device.state === "registered" ? "active" : "inactive")); row.append(stateCell); const updated = document.createElement("td"); updated.textContent = deviceTime(device.updated_at); row.append(updated); elements.ownDevicesBody.append(row); });
+  devices.forEach((device) => { const row = document.createElement("tr"); const id = document.createElement("td"); id.textContent = device.device_id; row.append(id); const stateCell = document.createElement("td"); stateCell.append(deviceStateCell(device)); row.append(stateCell); const updated = document.createElement("td"); updated.textContent = deviceTime(device.updated_at); row.append(updated); elements.ownDevicesBody.append(row); });
 }
 
 function deviceLimitReached(devices) { return devices.filter((device) => device.state === "registered").length >= 10; }
@@ -541,7 +568,37 @@ function renderDevices(devices, account) {
   elements.openAddDevice.disabled = limitReached;
   elements.openAddDevice.title = limitReached ? "该账户已达到 10 条已登记设备记录上限。" : "";
   if (devices.length === 0) emptyRow(elements.devicesBody, 4, "这个账户还没有设备记录", "点击“登记设备”，添加便于管理的设备标识。");
-  devices.forEach((device) => { const row = document.createElement("tr"); const id = document.createElement("td"); id.textContent = device.device_id; row.append(id); const stateCell = document.createElement("td"); stateCell.append(statusBadge(deviceStateText(device.state), device.state === "registered" ? "active" : "inactive")); row.append(stateCell); const updated = document.createElement("td"); updated.textContent = deviceTime(device.updated_at); row.append(updated); const actions = document.createElement("td"); actions.className = "table-actions"; if (device.state === "registered") { const remove = document.createElement("button"); remove.className = "link-button"; remove.type = "button"; remove.textContent = "移除记录"; remove.addEventListener("click", () => removeDevice(account, device, remove)); actions.append(remove); } else { actions.textContent = "—"; } row.append(actions); elements.devicesBody.append(row); });
+  const accountActive = state.deviceAccounts.some((user) => user.username === account && user.active);
+  devices.forEach((device) => {
+    const row = document.createElement("tr");
+    row.insertCell().textContent = device.device_id;
+    row.insertCell().append(deviceStateCell(device));
+    row.insertCell().textContent = deviceTime(device.updated_at);
+    const actions = row.insertCell();
+    actions.className = "table-actions";
+    const action = (label, run) => {
+      const button = document.createElement("button");
+      button.className = "link-button";
+      button.type = "button";
+      button.textContent = label;
+      button.addEventListener("click", () => run(account, device, button));
+      actions.append(button);
+    };
+    const vpn = device.vpn_state;
+    if (device.state === "registered") {
+      if (accountActive && (vpn === "unmanaged" || vpn === "disabled")) {
+        action(vpn === "unmanaged" ? "配置设备" : "重新签发", provisionDevice);
+      }
+      if (vpn === "enabled" || vpn === "provisioning" || vpn === "unavailable") {
+        action("禁用设备", disableDevice);
+      }
+      if (!vpn || vpn === "unmanaged" || vpn === "disabled") {
+        action("移除记录", removeDevice);
+      }
+    }
+    if (!actions.childNodes.length) actions.textContent = "—";
+    elements.devicesBody.append(row);
+  });
 }
 function openDeviceDialog() {
   const account = elements.deviceAccountSelect.value;
@@ -633,6 +690,7 @@ elements.openAddDevice.addEventListener("click", openDeviceDialog);
 $("#close-device-dialog").addEventListener("click", () => elements.deviceDialog.close());
 $("#cancel-device").addEventListener("click", () => elements.deviceDialog.close());
 elements.deviceForm.addEventListener("submit", submitDeviceRegistration);
+$("#refresh-devices").addEventListener("click", () => loadDevices());
 elements.deviceAccountSelect.addEventListener("change", () => { state.selectedDeviceAccount = elements.deviceAccountSelect.value; loadDevices(); });
 elements.auditPrev.addEventListener("click", () => { if (state.auditIndex > 0) { state.auditIndex -= 1; loadAudit(); } });
 elements.auditNext.addEventListener("click", () => { if (state.auditCursors[state.auditIndex + 1] != null) { state.auditIndex += 1; loadAudit(); } });

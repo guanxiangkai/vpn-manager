@@ -201,6 +201,21 @@ class GatewayClient:
             raise GatewayUnavailable()
         return {key: value for key, value in reply.items() if key != "code" or value is not None}
 
+    def connected_identities(self, usernames: list[str]) -> set[str]:
+        """Return only exact requested identities currently backed by a live Child SA."""
+        if (not isinstance(usernames, list) or not usernames or len(usernames) > 1024
+                or any(not isinstance(username, str) for username in usernames)
+                or len(usernames) != len(set(usernames))):
+            raise ValueError("无效账户列表")
+        usernames = [_validate_username(username) for username in usernames]
+        reply = self._request({"action": "connections", "usernames": usernames})
+        if set(reply) != {"usernames"} or not isinstance(reply["usernames"], list):
+            raise GatewayUnavailable()
+        online = reply["usernames"]
+        if any(not isinstance(item, str) or item not in usernames for item in online) or len(online) != len(set(online)):
+            raise GatewayUnavailable()
+        return set(online)
+
 
 def run_once(database_path: str, socket_path: str, *, retry_failed: bool = False) -> int:
     """尝试每个待处理任务一次；显式重试复用失败任务的原操作标识。"""

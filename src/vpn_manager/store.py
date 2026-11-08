@@ -1,4 +1,4 @@
-"""账户、密码会话、设备管理记录与审计；设备记录不参与认证。"""
+"""账户、会话、设备 VPN 准入、网关投递与审计。"""
 from __future__ import annotations
 
 import json
@@ -11,7 +11,7 @@ from typing import Iterator
 
 from .security import token_hash, utc_text
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 MAX_ENROLLED_DEVICES = 10
 
 
@@ -62,10 +62,19 @@ class Store:
             tables = {r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             old = connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone() if "schema_metadata" in tables else None
             version = old[0] if old else None
-            if version not in {None, "1", "2", "3", "4", "5", "6", "7"}:
+            if version not in {None, "1", "2", "3", "4", "5", "6", "7", "8"}:
                 raise RuntimeError("不支持的数据库结构版本")
             if version is None and tables - {"sqlite_sequence"}:
                 raise RuntimeError("已有数据库缺少结构版本，拒绝猜测迁移")
+            # Keep the existing account generations and encrypted delivery queue.
+            # Only their foreign-key target changes to include device identities.
+            legacy_gateway = "gateway_accounts" in tables and any(
+                row["table"] == "users" for row in connection.execute("PRAGMA foreign_key_list(gateway_accounts)")
+            )
+            if legacy_gateway:
+                connection.execute("ALTER TABLE gateway_accounts RENAME TO previous_gateway_accounts")
+                connection.execute("ALTER TABLE gateway_outbox RENAME TO previous_gateway_outbox")
+                connection.execute("DROP INDEX IF EXISTS gateway_outbox_pending_idx")
             statements = [
                 "CREATE TABLE IF NOT EXISTS schema_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
                 "CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('admin','user')), active INTEGER NOT NULL CHECK(active IN (0,1)), created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
@@ -74,12 +83,25 @@ class Store:
                 "CREATE TABLE IF NOT EXISTS login_attempts (source_ip TEXT NOT NULL, username TEXT NOT NULL, window_started_at TEXT NOT NULL, failure_count INTEGER NOT NULL CHECK(failure_count>=0), PRIMARY KEY(source_ip,username))",
                 "CREATE TABLE IF NOT EXISTS audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, occurred_at TEXT NOT NULL, actor TEXT, source_ip TEXT, action TEXT NOT NULL, target TEXT, outcome TEXT NOT NULL CHECK(outcome IN ('success','failure','denied')))",
                 "CREATE INDEX IF NOT EXISTS audit_events_id_idx ON audit_events(id DESC)",
-                "CREATE TABLE IF NOT EXISTS gateway_accounts (username TEXT PRIMARY KEY REFERENCES users(username) ON DELETE CASCADE, generation INTEGER NOT NULL CHECK(generation>=1), applied_generation INTEGER, state TEXT NOT NULL CHECK(state IN ('queued','pending','applied','failed','superseded')), code TEXT, updated_at TEXT NOT NULL)",
-                "CREATE TABLE IF NOT EXISTS gateway_outbox (operation_id TEXT PRIMARY KEY, username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE, generation INTEGER NOT NULL CHECK(generation>=1), active INTEGER NOT NULL CHECK(active IN (0,1)), networks_json TEXT NOT NULL, credential_envelope TEXT, state TEXT NOT NULL CHECK(state IN ('queued','pending','applied','failed','superseded')), code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(username,generation))",
+                """CREATE TABLE IF NOT EXISTS gateway_identities (
+                    username TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+                    device_id TEXT, disabled INTEGER NOT NULL DEFAULT 0 CHECK(disabled IN (0,1)),
+                    CHECK((device_id IS NULL AND username=account_id AND disabled=0) OR
+                          (device_id IS NOT NULL AND username<>account_id)),
+                    UNIQUE(account_id,device_id),
+                    FOREIGN KEY(account_id,device_id) REFERENCES device_records(account_id,device_id))""",
+                "CREATE TABLE IF NOT EXISTS gateway_accounts (username TEXT PRIMARY KEY REFERENCES gateway_identities(username) ON DELETE CASCADE, generation INTEGER NOT NULL CHECK(generation>=1), applied_generation INTEGER, state TEXT NOT NULL CHECK(state IN ('queued','pending','applied','failed','superseded')), code TEXT, updated_at TEXT NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS gateway_outbox (operation_id TEXT PRIMARY KEY, username TEXT NOT NULL REFERENCES gateway_identities(username) ON DELETE CASCADE, generation INTEGER NOT NULL CHECK(generation>=1), active INTEGER NOT NULL CHECK(active IN (0,1)), networks_json TEXT NOT NULL, credential_envelope TEXT, state TEXT NOT NULL CHECK(state IN ('queued','pending','applied','failed','superseded')), code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(username,generation))",
                 "CREATE INDEX IF NOT EXISTS gateway_outbox_pending_idx ON gateway_outbox(state,created_at)",
             ]
             for sql in statements:
                 connection.execute(sql)
+            if legacy_gateway:
+                connection.execute("INSERT INTO gateway_identities(username,account_id) SELECT username,username FROM users")
+                connection.execute("INSERT INTO gateway_accounts SELECT * FROM previous_gateway_accounts")
+                connection.execute("INSERT INTO gateway_outbox SELECT * FROM previous_gateway_outbox")
+                connection.execute("DROP TABLE previous_gateway_outbox")
+                connection.execute("DROP TABLE previous_gateway_accounts")
             if version in {"1", "2", "3"} and "sessions" in tables:
                 connection.execute("ALTER TABLE sessions RENAME TO sessions_before_password_auth")
             connection.execute("""CREATE TABLE IF NOT EXISTS sessions (
@@ -118,7 +140,7 @@ class Store:
                 id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE,
                 description TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('existing','draft')),
                 version INTEGER NOT NULL CHECK(version>=1), created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
-            if version != "7":
+            if version not in {"7", "8"}:
                 now = utc_text()
                 connection.executemany("INSERT INTO network_catalog(id,name,description,state,version,created_at,updated_at) VALUES (?,?,?,'existing',1,?,?) ON CONFLICT(id) DO NOTHING", [
                     ("home", "家庭", "家庭局域网资源", now, now),
@@ -185,6 +207,27 @@ class Store:
         with self.connect() as connection:
             return [dict(row) for row in connection.execute("SELECT * FROM device_records WHERE account_id=? ORDER BY created_at,device_id", (account_id,))]
 
+    def list_device_access(self, account_id: str) -> list[dict]:
+        with self.connect() as connection:
+            rows = connection.execute("""SELECT d.*, i.username AS vpn_username, i.disabled,
+                g.state AS gateway_state, g.generation, g.applied_generation, u.active AS account_active
+                FROM device_records d JOIN users u ON u.username=d.account_id
+                LEFT JOIN gateway_identities i ON i.account_id=d.account_id AND i.device_id=d.device_id
+                LEFT JOIN gateway_accounts g ON g.username=i.username
+                WHERE d.account_id=? ORDER BY d.created_at,d.device_id""", (account_id,))
+            return [dict(row) for row in rows]
+
+    @staticmethod
+    def device_identity(connection, account_id: str, device_id: str):
+        return connection.execute("""SELECT i.username,i.disabled,g.state AS gateway_state
+            FROM gateway_identities i LEFT JOIN gateway_accounts g ON g.username=i.username
+            WHERE i.account_id=? AND i.device_id=?""", (account_id, device_id)).fetchone()
+
+    @staticmethod
+    def enabled_device_identities(connection, account_id: str) -> list[str]:
+        return [row[0] for row in connection.execute("""SELECT username FROM gateway_identities
+            WHERE account_id=? AND device_id IS NOT NULL AND disabled=0 ORDER BY username""", (account_id,))]
+
     def register_device(self, account_id: str, device_id: str, actor=None, source_ip=None) -> dict:
         with self.write_transaction() as connection:
             return self.register_device_in_transaction(connection, account_id, device_id, actor, source_ip)
@@ -207,6 +250,9 @@ class Store:
             return self.remove_device_in_transaction(connection, account_id, device_id, actor, source_ip)
 
     def remove_device_in_transaction(self, connection, account_id: str, device_id: str, actor=None, source_ip=None) -> dict | None:
+        identity = self.device_identity(connection, account_id, device_id)
+        if identity and (not identity["disabled"] or identity["gateway_state"] != "applied"):
+            raise DeviceConflict()
         changed = connection.execute("UPDATE device_records SET state='removed',updated_at=? WHERE account_id=? AND device_id=?", (utc_text(),account_id,device_id)).rowcount
         if not changed:
             return None
@@ -218,7 +264,7 @@ class Store:
         row = connection.execute("SELECT generation FROM gateway_accounts WHERE username=?", (username,)).fetchone()
         return (row["generation"] + 1) if row else 1
 
-    def queue_gateway_change(self, connection, username: str, generation: int, active: bool, networks: list[str], credential_envelope: dict | None) -> str:
+    def queue_gateway_change(self, connection, username: str, generation: int, active: bool, networks: list[str], credential_envelope: dict | None, *, discard_pending_credential: bool = False) -> str:
         """将完整期望状态原子入队；后续版本会取代尚未执行的旧版本。"""
         if generation != self.next_gateway_generation(connection, username) or not isinstance(active, bool):
             raise ValueError("无效网关同步版本")
@@ -229,9 +275,11 @@ class Store:
             envelope_json = json.dumps(credential_envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
             if len(envelope_json.encode("utf-8")) > 8 * 1024:
                 raise ValueError("凭据封装过大")
+        connection.execute("""INSERT INTO gateway_identities(username,account_id)
+            SELECT username,username FROM users WHERE username=? ON CONFLICT(username) DO NOTHING""", (username,))
         now, operation_id = utc_text(), uuid.uuid4().hex
         # 密文 AAD 绑定 generation。非密码变更必须保留前一含密文任务，待它先成功后才可应用新策略。
-        if credential_envelope is not None:
+        if credential_envelope is not None or discard_pending_credential:
             connection.execute("UPDATE gateway_outbox SET state='superseded', credential_envelope=NULL, updated_at=? WHERE username=? AND state IN ('queued','pending','failed')", (now, username))
         else:
             connection.execute("UPDATE gateway_outbox SET state='superseded', credential_envelope=NULL, updated_at=? WHERE username=? AND state IN ('queued','pending','failed') AND credential_envelope IS NULL", (now, username))

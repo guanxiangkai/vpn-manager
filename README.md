@@ -1,6 +1,6 @@
 # VPN 管理器
 
-用于小规模 VPN 账户、网络权限、设备登记记录和审计日志的管理服务，包含 FastAPI 接口与静态管理网页。公开仓库只保存应用源码和测试，不保存生产账户密码、私钥、证书或服务器备份。
+用于小规模 VPN 账户、网络权限、设备连接状态与审计日志的管理服务，包含 FastAPI 接口与静态管理网页。公开仓库只保存应用源码和测试，不保存生产账户密码、私钥、证书或服务器备份。
 
 **当前处于网关集成验收阶段。** 已实现账户变更事务、加密 outbox、独立 root 网关代理及 strongSwan VICI/nft 投影。只有网关确认具体版本为 `applied`，才能视为该版本已下发；数据库保存成功、排队成功和单元测试通过均不等于真实 VPN 验收。生产切换须先完成隔离 IKE/转发验收、备份和独立自动回滚。
 
@@ -11,7 +11,7 @@
 - `GET /api/auth/me` 为无副作用的只读用户资料接口；Cookie 模式通过 `POST /api/auth/refresh` 恢复会话，Bearer 模式刷新页面后需重新登录。
 - 管理员可管理账户、设备登记记录和审计；普通用户仅可访问自己的资料和设备记录，不能读取或修改他人数据。服务端执行角色与账户隔离。
 - 修改账户密码、角色、启用状态或网络权限会立即撤销该账户的管理会话。
-- 设备名单只是管理记录。每账户最多 10 条 `registered` 记录，`removed` 记录不占名额；它不认证设备，也不会阻止取得账户密码的新设备登录或连接 VPN。
+- 每账户最多 10 条已登记设备。管理员可为登记设备签发独立的 IKEv2 用户名和密码，密码仅在签发响应中显示。设备继承所属账户的网络授权。网关以已认证的设备身份和已安装的 Child SA 判断在线；网关不可达时连接状态为未知。
 - 审计记录登录成功/失败、退出和管理操作；不会写入密码、哈希、Cookie、Bearer 令牌或请求体。
 
 ## 运行环境与安装
@@ -79,11 +79,13 @@ OSS 跨站模式下，所有 `/api` 请求（包括读取和预检）必须携�
 - 网络目录：`GET /api/networks` 只返回本人已授权网络；管理员使用 `GET/POST /api/admin/networks`、`PATCH /api/admin/networks/{id}` 维护名称、说明与草稿。修改时提交 `version`，旧版本返回 `409 network_version_conflict`。新增为草稿，不能直接用于账户授权或自动接通 VPN。
 - 管理员：`GET/POST /api/admin/users`、`PATCH /api/admin/users/{username}`、`POST /api/admin/users/{username}/deactivate`、`GET /api/admin/audit?cursor=&limit=20`、`GET/POST /api/admin/users/{username}/devices`、`POST /api/admin/users/{username}/devices/{device_id}/remove`。
 
-创建设备记录的请求体只有 `{ "device_id": string }`。`DeviceView` 为 `account_id`、`device_id`、`state`（`registered` 或 `removed`）、`created_at`、`updated_at`；移除记录不等于撤销 VPN 访问。
+管理员为登记设备签发专用凭据使用 `POST /api/admin/users/{username}/devices/{device_id}/provision`，禁用使用同路径下的 `disable`。禁用后由网关卸载该身份的认证并终止其活动会话，网关确认后才显示已禁用。禁用后可重新签发，旧设备密码随之失效。共享账户密码仍可使用，其连接无法归属到某条设备记录。
+
+创建设备记录的请求体只有 `{ "device_id": string }`。`DeviceView` 为 `account_id`、`device_id`、`state`（`registered` 或 `removed`）、`created_at`、`updated_at`，以及 `vpn_state` 和 `connection_state`。需要先确认禁用专用凭据，再移除设备记录。
 
 `UserView.protected` 标记固定系统管理员 `guanxiangkai`。该账户不能降级或停用，服务端在事务中返回 `409 system_admin_protected`，其他管理员也不能绕过。其密码、网络授权仍走既有更新及审计流程；普通用户仍只能拥有工作网络权限。
 
-网络目录迁移将数据库 v6 增量升级到 v7，保留既有账户、会话和授权。目录编辑不生成网关投递任务；改名不更换网络标识。旧代码拒绝 v7 数据库，恢复时必须使用发布前一致快照和对应旧代码，不能只回退程序。
+网络目录迁移将数据库 v6 增量升级到 v7，保留既有账户、会话和授权。目录编辑不生成网关投递任务；改名不更换网络标识。设备管理将数据库增量升级到 v8，保留既有网关版本和投递任务。API 和同步进程须使用相同版本；回退须使用发布前一致快照与对应版本。当前代理启动会逐账户重新投影并终止托管 SA，部署代理新版本前须安排并验收网关切换。
 
 ## 网关权限与恢复
 
