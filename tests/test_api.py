@@ -3,6 +3,8 @@ from __future__ import annotations
 import sqlite3
 import json
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
+import os
 from threading import Barrier, Event
 
 from fastapi.testclient import TestClient
@@ -10,7 +12,8 @@ import pytest
 
 from vpn_manager.app import ALLOWED_ORIGIN, create_app
 from vpn_manager.bootstrap import bootstrap
-from vpn_manager.security import COOKIE_NAME, hash_password, token_hash, utc_text
+from vpn_manager import session_snapshot
+from vpn_manager.security import COOKIE_NAME, hash_password, token_hash, utc_now, utc_text
 from vpn_manager.store import DeviceQuotaExceeded, SCHEMA_VERSION, Store
 
 
@@ -36,6 +39,49 @@ def login(client,username='adminone',password='correct-horse-admin-one'):
 
 def csrf(token):
     return {'Origin':ALLOWED_ORIGIN,'X-CSRF-Token':token}
+
+
+def test_live_vpn_connections_are_admin_only_and_keep_shared_source_sessions_separate(database, tmp_path, monkeypatch):
+    monkeypatch.setattr(session_snapshot, "SNAPSHOT_OWNER", os.getuid())
+    path = tmp_path / "sessions.json"
+    client = TestClient(create_app(database, session_snapshot_path=path), base_url=ALLOWED_ORIGIN)
+    endpoint = "/api/admin/vpn-connections"
+    assert client.get(endpoint).status_code == 401
+    login(client, "member", "correct-horse-member")
+    assert client.get(endpoint).status_code == 403
+    login(client)
+    assert client.get(endpoint).status_code == 503
+
+    now = utc_now()
+    first = {
+        "username": "adminone",
+        "session_id": "1",
+        "remote_address": "198.51.100.25",
+        "remote_port": 4500,
+        "virtual_addresses": ["10.77.10.8"],
+        "connected_at": now.isoformat(),
+    }
+    second = {**first, "session_id": "2", "remote_port": 4501, "virtual_addresses": ["10.77.10.9"]}
+    unrelated = {**first, "username": "unmanaged", "session_id": "3"}
+    data = {"sampled_at": now.isoformat(), "sessions": [first, second, unrelated]}
+    path.write_text(json.dumps(data))
+    path.chmod(0o640)
+
+    response = client.get(endpoint)
+    assert response.status_code == 200, response.text
+    assert response.headers["cache-control"] == "no-store"
+    accounts = response.json()["accounts"]
+    assert accounts[1] == {"username": "member", "sessions": []}
+    assert accounts[0]["username"] == "adminone"
+    assert [row["session_id"] for row in accounts[0]["sessions"]] == ["1", "2"]
+    assert all(row["remote_address"] == "198.51.100.25" for row in accounts[0]["sessions"])
+    assert all("username" not in row for row in accounts[0]["sessions"])
+
+    data["sampled_at"] = (now - timedelta(minutes=2)).isoformat()
+    path.write_text(json.dumps(data))
+    assert client.get(endpoint).json()["error"]["code"] == "vpn_connections_unavailable"
+    path.write_text("invalid")
+    assert client.get(endpoint).status_code == 503
 
 
 def test_password_login_requires_no_device_and_preserves_cookie_controls(database):

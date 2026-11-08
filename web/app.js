@@ -1,12 +1,12 @@
 const DEFAULT_AUDIT_LIMIT = 20;
-const state = { apiBaseUrl: "", sessionTransport: "cookie", sessionToken: null, csrfToken: null, user: null, users: [], usersSerial: 0, auditCursors: [null], auditIndex: 0, auditSerial: 0, networks: [], networkNames: new Map(), networksSerial: 0, editingNetwork: null, userDialogSerial: 0, requestIds: new Map() };
+const state = { apiBaseUrl: "", sessionTransport: "cookie", sessionToken: null, csrfToken: null, user: null, users: [], usersSerial: 0, auditCursors: [null], auditIndex: 0, auditSerial: 0, connectionsSerial: 0, networks: [], networkNames: new Map(), networksSerial: 0, editingNetwork: null, userDialogSerial: 0, requestIds: new Map() };
 
 const $ = (selector) => document.querySelector(selector);
 const elements = {
   loginView: $("#login-view"), appView: $("#app-view"), loginForm: $("#login-form"), loginSubmit: $("#login-submit"),
   loginError: $("#login-error"), serviceState: $("#service-state"), notice: $("#notice"), signedInUser: $("#signed-in-user"),
   logout: $("#logout-button"), profileState: $("#profile-state"), profileContent: $("#profile-content"), networkList: $("#network-list"),
-  usersState: $("#users-state"), usersContent: $("#users-content"), usersBody: $("#users-body"), auditState: $("#audit-state"),
+  usersState: $("#users-state"), usersContent: $("#users-content"), usersBody: $("#users-body"), auditState: $("#audit-state"), connectionsState: $("#connections-state"), connectionsContent: $("#connections-content"),
   auditContent: $("#audit-content"), auditBody: $("#audit-body"), auditPrev: $("#audit-prev"), auditNext: $("#audit-next"), auditPageLabel: $("#audit-page-label"),
   userDialog: $("#user-dialog"), userForm: $("#user-form"), userFormError: $("#user-form-error"), managedUsername: $("#managed-username"),
   managedPassword: $("#managed-password"), editingUsername: $("#editing-username"), passwordHint: $("#password-hint"), userDialogTitle: $("#user-dialog-title"), saveUser: $("#save-user")
@@ -195,7 +195,7 @@ async function loadVpnStatus(user) {
 function showLogin() {
   document.title = "登录 · VPN 管理器";
   // 会话切换必须使仍在飞行的旧账户读取结果过期，避免其覆盖新账户页面。
-  state.usersSerial += 1; state.auditSerial += 1; state.networksSerial += 1; state.userDialogSerial += 1;
+  state.usersSerial += 1; state.auditSerial += 1; state.networksSerial += 1; state.connectionsSerial += 1; state.userDialogSerial += 1;
   state.users = []; state.auditCursors = [null]; state.auditIndex = 0;
   $("#user-search").value = ""; $("#user-status-filter").value = "all";
   state.networks = []; state.networkNames.clear(); state.editingNetwork = null; $("#network-search").value = "";
@@ -257,12 +257,12 @@ function showPage(page) {
     item.classList.toggle("active", current);
     if (current) item.setAttribute("aria-current", "page"); else item.removeAttribute("aria-current");
   });
-  const title = ({ overview: "访问概览", networks: "网络环境", users: "账户与授权", audit: "登录审计" })[page];
+  const title = ({ overview: "访问概览", networks: "网络环境", users: "账户与授权", audit: "登录审计", connections: "实时会话" })[page];
   $("#current-page-name").textContent = title;
   document.title = `${title} · VPN 管理器`;
   $("#main-content").focus({ preventScroll: true });
   window.scrollTo({ top: 0, behavior: "instant" });
-  if (page === "users") loadUsers(); if (page === "audit") loadAudit();
+  if (page === "users") loadUsers(); if (page === "audit") loadAudit(); if (page === "connections") loadConnections();
   if (page === "networks") loadNetworks();
 }
 
@@ -339,6 +339,49 @@ async function submitNetwork(event) {
     if (isSessionError(error)) { showLogin(); return; }
     if (error.name !== "AbortError") showError($("#network-form-error"), humanError(error));
   } finally { setBusy($("#save-network"), false, ""); }
+}
+
+function renderConnections(accounts) {
+  const list = $("#connections-list");
+  list.replaceChildren();
+  let total = 0;
+  for (const { username, sessions } of accounts) {
+    total += sessions.length;
+    const card = textElement("article", "", "connection-card");
+    const heading = textElement("div", "", "connection-card-heading");
+    heading.append(textElement("strong", username), statusBadge(sessions.length ? "在线" : "离线", sessions.length ? "active" : "inactive"));
+    card.append(heading, textElement("p", `会话数 ${sessions.length}`, "connection-count"));
+    for (const session of sessions) {
+      const detail = textElement("div", "", "connection-detail");
+      const { remote_address: address, remote_port: port } = session;
+      const host = address?.includes(":") && port ? `[${address}]` : address;
+      const endpoint = host && port ? `${host}:${port}` : host;
+      const connected = session.connected_at ? new Date(session.connected_at).toLocaleString("zh-CN", { hour12: false }) : "未知";
+      detail.append(
+        textElement("span", `会话 ${session.session_id}`),
+        textElement("span", `来源 ${endpoint || "未知"}`),
+        textElement("span", `VPN 地址 ${session.virtual_addresses.join(", ") || "未知"}`),
+        textElement("span", `建立时间 ${connected}`),
+      );
+      card.append(detail);
+    }
+    list.append(card);
+  }
+  if (!list.children.length) list.append(textElement("p", "暂无管理账户。", "state-panel"));
+  $("#connections-total").textContent = `会话数 ${total}`;
+}
+
+async function loadConnections() {
+  if (state.user?.role !== "admin") return;
+  elements.connectionsContent.hidden = true; setPanel(elements.connectionsState, "", "正在读取实时会话…"); const serial = ++state.connectionsSerial;
+  try {
+    const result = await apiRequest("/api/admin/vpn-connections"); if (serial !== state.connectionsSerial || state.user?.role !== "admin") return;
+    renderConnections(result.accounts); const sampled = new Date(result.sampled_at); $("#connections-sampled").textContent = Number.isNaN(sampled.valueOf()) ? "采样时间未知" : `采样于 ${sampled.toLocaleString("zh-CN", { hour12: false })}`;
+    elements.connectionsState.hidden = true; elements.connectionsContent.hidden = false;
+  } catch (error) {
+    if (serial !== state.connectionsSerial || error.name === "AbortError") return; if (isSessionError(error)) { showLogin(); return; }
+    setPanel(elements.connectionsState, "error", error.code === "gateway_unavailable" || error.status === 503 ? "网关暂不可用，在线状态未知。请稍后重试。" : `无法读取实时会话：${humanError(error)}`);
+  }
 }
 
 async function loadUsers() {
@@ -508,6 +551,7 @@ async function logout() {
 elements.loginForm.addEventListener("submit", submitLogin);
 elements.logout.addEventListener("click", logout);
 document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("click", () => showPage(item.dataset.page)));
+$("#refresh-connections").addEventListener("click", loadConnections);
 $("#user-search").addEventListener("input", renderUsers);
 $("#user-status-filter").addEventListener("change", renderUsers);
 $("#refresh-users").addEventListener("click", loadUsers);

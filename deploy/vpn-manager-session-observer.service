@@ -1,0 +1,25 @@
+[Unit]
+Description=VPN 管理器只读 IKEv2 会话采集
+
+[Service]
+Type=oneshot
+User=root
+Group=vpn-manager
+EnvironmentFile=/etc/vpn-manager/session-observer.env
+ExecStart=/opt/vpn-manager/web-current/venv/bin/python -I /opt/vpn-manager/session-observer/session_observer.py --vici-socket ${VPN_MANAGER_SESSION_VICI_SOCKET} --snapshot /run/vpn-manager-session-view/sessions.json
+RuntimeDirectory=vpn-manager-session-view
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+TimeoutStartSec=6
+MemoryMax=64M
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true

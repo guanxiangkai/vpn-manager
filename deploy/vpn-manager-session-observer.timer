@@ -1,0 +1,10 @@
+[Unit]
+Description=定期采集 VPN 网关实时会话
+
+[Timer]
+OnBootSec=2s
+OnUnitInactiveSec=12s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

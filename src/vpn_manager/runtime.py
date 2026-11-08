@@ -109,7 +109,10 @@ def application():
     if socket_path and not Path(socket_path).is_absolute():
         raise RuntimeError("网关 Unix socket 必须使用绝对路径")
     gateway_client = GatewayClient(socket_path) if socket_path else None
-    return create_app(database, allowed_origin=os.environ["VPN_MANAGER_ORIGIN"], web_directory=os.environ.get("VPN_MANAGER_WEB_DIRECTORY") or None, gateway_public_key=gateway_public_key, gateway_client=gateway_client, session_transport=os.environ.get("VPN_MANAGER_SESSION_TRANSPORT", "cookie"))
+    snapshot_path = os.environ.get("VPN_MANAGER_SESSION_SNAPSHOT")
+    if snapshot_path and not Path(snapshot_path).is_absolute():
+        raise RuntimeError("VPN 会话快照必须使用绝对路径")
+    return create_app(database, allowed_origin=os.environ["VPN_MANAGER_ORIGIN"], web_directory=os.environ.get("VPN_MANAGER_WEB_DIRECTORY") or None, gateway_public_key=gateway_public_key, gateway_client=gateway_client, session_transport=os.environ.get("VPN_MANAGER_SESSION_TRANSPORT", "cookie"), session_snapshot_path=Path(snapshot_path) if snapshot_path else None)
 
 
 def main() -> None:

@@ -15,8 +15,9 @@ from fastapi.responses import JSONResponse
 from starlette.staticfiles import StaticFiles
 
 from .gateway_sync import GatewayClient, GatewayUnavailable, seal_credential
-from .models import AuditPage, DeviceCreate, DeviceView, ErrorResponse, GatewayStatus, LoginRequest, LoginResponse, MeResponse, MessageResponse, NetworkCreate, NetworkUpdate, NetworkView, UserCreate, UserUpdate, UserView
+from .models import AuditPage, DeviceCreate, DeviceView, ErrorResponse, GatewayStatus, LoginRequest, LoginResponse, MeResponse, MessageResponse, NetworkCreate, NetworkUpdate, NetworkView, UserCreate, UserUpdate, UserView, VpnConnection, VpnConnectionsView
 from .security import COOKIE_NAME, SESSION_TTL, hash_password, needs_rehash, new_secret, token_hash, utc_now, utc_text, verify_password
+from .session_snapshot import read_session_snapshot
 from .store import DeviceConflict, DeviceQuotaExceeded, Store
 
 ALLOWED_ORIGIN = "https://slimjoy.cn"
@@ -108,7 +109,7 @@ class RequestBoundaryMiddleware:
         await self.app(scope,replay,secured_send)
 
 
-def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_origin: str = ALLOWED_ORIGIN, web_directory: str | Path | None = None, gateway_public_key: bytes | None = None, gateway_client: GatewayClient | None = None, session_transport: str = "cookie") -> FastAPI:
+def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_origin: str = ALLOWED_ORIGIN, web_directory: str | Path | None = None, gateway_public_key: bytes | None = None, gateway_client: GatewayClient | None = None, session_transport: str = "cookie", session_snapshot_path: Path | None = None) -> FastAPI:
     origin = urlsplit(allowed_origin)
     if origin.scheme!="https" or not origin.hostname or origin.username or origin.password or origin.path or origin.query or origin.fragment:
         raise ValueError("管理入口必须是无路径的 HTTPS 来源")
@@ -355,6 +356,25 @@ def create_app(database_path: str | Path = "./vpn-manager.sqlite3", *, allowed_o
     @app.get("/api/admin/users", response_model=list[UserView], responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}})
     def list_users(_: Annotated[dict[str, Any], Depends(admin_user)]) -> list[dict[str, Any]]:
         return [public_user(item) for item in store.list_users()]
+
+    @app.get("/api/admin/vpn-connections", response_model=VpnConnectionsView,
+             responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}, 503: {"model": ErrorResponse}})
+    def vpn_connections(_: Annotated[dict[str, Any], Depends(admin_user)]) -> dict[str, Any]:
+        snapshot = read_session_snapshot(session_snapshot_path)
+        if snapshot is None:
+            raise ApiError(503, "vpn_connections_unavailable", "暂时无法确认 VPN 连接状态，请稍后刷新。")
+        sessions_by_user: dict[str, list[VpnConnection]] = {}
+        for session in snapshot.sessions:
+            sessions_by_user.setdefault(session.username, []).append(
+                VpnConnection(**session.model_dump(mode="json", exclude={"username"}))
+            )
+        return {
+            "sampled_at": snapshot.sampled_at,
+            "accounts": [
+                {"username": user["username"], "sessions": sessions_by_user.get(user["username"], [])}
+                for user in store.list_users()
+            ],
+        }
 
     @app.post("/api/admin/users", response_model=UserView, status_code=201, responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}, 409: {"model": ErrorResponse}})
     def create_user(payload: UserCreate, request: Request, actor: Annotated[dict[str, Any], Depends(admin_mutation_user)]) -> dict[str, Any]:

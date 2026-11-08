@@ -55,3 +55,12 @@ IP 短期证书需要无人值守续期和到期监测，不能签发一次后�
 续期通过 VICI 加载服务器密钥及中间证书，再由账户代理的串行控制接口更新活动且已生效的账户连接模板。它不会重启 IKE 进程、终止现有 SA 或恢复停用账户；网关未运行时，续期调用直接返回 `gateway_inactive`。控制请求仅允许 `{"action":"reload_certificate"}`，不能指定账户、路径或其他服务器身份。模板更新失败会恢复原证书文件并报错，已加载的密钥仍留在进程内供现有会话使用；不宣称该异常路径可事务性撤销部分已更新的模板。
 
 Web 证书钩子本身仍不操作 VPN。只有明确部署上述独立服务与续期后置调用，才会同步新网关证书。启用前应在独立 Linux 客户端验证续期后新连接可用、既有 SA 未被终止、停用账户未恢复，并分别完成 Mac、Windows 原生客户端验收。保存开机启动设置不等于已完成服务器重启验收。
+
+
+## 实时 VPN 会话
+
+管理员可在「实时会话」查看当前 IKEv2 连接。计数单位为具备已安装 CHILD SA 的 IKE 会话。共享账号、出口 IP 或 VPN 地址都不能作为物理设备标识，系统不创建设备档案或永久的账户设备关联。
+
+将同一版本的 `src/vpn_manager/session_observer.py` 作为 root 所有的文件部署到 `/opt/vpn-manager/session-observer/session_observer.py`，并安装对应的 `vpn-manager-session-observer.service` 和 `.timer`。在 root 控制的 `/etc/vpn-manager/session-observer.env` 中将 `VPN_MANAGER_SESSION_VICI_SOCKET` 设为独立强制访问保护的 IKEv2 VICI socket 绝对路径。此采集器只调用 `list-sas`，无需重启网关、修改套接字权限或向 Web 用户开放控制套接字。
+
+Web API 通过 `VPN_MANAGER_SESSION_SNAPSHOT=/run/vpn-manager-session-view/sessions.json` 读取当前快照。文件由采集器原子更新，root 持有且 Web 组只读。超过 45 秒、权限不合规或无效的快照返回 503，界面显示状态未知。请先验证采集器及当前 Web API，再发布前端入口。

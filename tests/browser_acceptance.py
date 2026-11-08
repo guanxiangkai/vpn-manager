@@ -121,9 +121,29 @@ def test_admin_login_refresh_pages_and_logout(context, live_env):
     page.get_by_role("button", name="退出登录", exact=True).click()
     expect(page.locator("#login-view")).to_be_visible(timeout=15_000)
     expect(page.locator("#app-view")).to_be_hidden()
+
     page.reload(wait_until="domcontentloaded")
     expect(page.locator("#login-view")).to_be_visible(timeout=15_000)
     expect(page.locator("#app-view")).to_be_hidden()
+
+
+def test_admin_live_connections_counts_sessions_and_explains_device_limit(context, live_env):
+    page = context.new_page()
+    _login(page, live_env, ADMIN)
+    page.route("**/api/admin/vpn-connections", lambda route: route.fulfill(status=200, content_type="application/json", body='{"sampled_at":"2026-01-01T00:00:00Z","accounts":[{"username":"adminone","sessions":[{"session_id":"1","remote_address":"198.51.100.2","remote_port":4500,"virtual_addresses":["10.77.64.2"],"connected_at":null}]},{"username":"member","sessions":[]}]}'))
+    page.locator('.nav-item[data-page="connections"]').click()
+    expect(page.locator("#connections-page")).to_be_visible()
+    expect(page.locator("#connections-content")).to_be_visible()
+    expect(page.locator("#connections-total")).to_contain_text("会话数 1")
+    expect(page.locator("#connections-list")).to_contain_text("在线")
+    expect(page.locator("#connections-list")).to_contain_text("离线")
+    expect(page.locator("#connections-page")).to_contain_text("会话数可能与实际设备数不同")
+    expect(page.locator("#connections-page")).to_contain_text("多台设备可以共用一个账户")
+    expect(page.locator("#connections-list")).to_contain_text("198.51.100.2:4500")
+    page.unroute("**/api/admin/vpn-connections")
+    page.get_by_role("button", name="刷新会话", exact=True).click()
+    expect(page.locator("#connections-state")).to_contain_text("未知")
+    expect(page.locator("#connections-content")).to_be_hidden()
 
 
 def test_member_can_read_own_access_overview(context, live_env):
@@ -131,7 +151,7 @@ def test_member_can_read_own_access_overview(context, live_env):
     _login(page, live_env, MEMBER)
     expect(page.get_by_role("heading", name="连接说明", exact=True)).to_be_visible()
     expect(page.locator("#my-devices-title")).to_have_count(0)
-    for page_name in ("users", "networks", "audit"):
+    for page_name in ("users", "networks", "audit", "connections"):
         expect(page.locator(f'.nav-item[data-page="{page_name}"]')).to_be_hidden()
     expect(page.get_by_role("button", name="退出登录", exact=True)).to_be_visible()
     _capture(page, "member-overview")

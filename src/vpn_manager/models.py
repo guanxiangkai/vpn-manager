@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, IPvAnyAddress, SecretStr, field_validator, model_validator
 
 Network = Literal["home", "work"]
 Role = Literal["admin", "user"]
@@ -104,6 +104,33 @@ class GatewayStatus(StrictModel):
     state: Literal["not_provisioned", "queued", "pending", "applied", "failed", "superseded"]
     code: str | None = None
     updated_at: datetime | None = None
+
+
+class VpnConnection(StrictModel):
+    session_id: str = Field(pattern=r"^[0-9]{1,20}$")
+    remote_address: IPvAnyAddress | None
+    remote_port: int | None = Field(ge=1, le=65535, strict=True)
+    virtual_addresses: list[IPvAnyAddress] = Field(max_length=16)
+    connected_at: AwareDatetime | None
+
+
+class ObservedVpnConnection(VpnConnection):
+    username: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
+
+
+class VpnConnectionSnapshot(StrictModel):
+    sampled_at: AwareDatetime
+    sessions: list[ObservedVpnConnection] = Field(max_length=512)
+
+
+class AccountVpnConnections(StrictModel):
+    username: str
+    sessions: list[VpnConnection]
+
+
+class VpnConnectionsView(StrictModel):
+    sampled_at: AwareDatetime
+    accounts: list[AccountVpnConnections]
 
 
 class MessageResponse(StrictModel):
