@@ -197,23 +197,12 @@ tbody tr:hover { background: #fbfcfd; }
 .integration-note { display: flex; align-items: flex-start; gap: 9px; color: #7a6032; background: #fcf8f0; border: 1px solid #eee4d1; border-radius: 8px; padding: 12px 15px; margin: 16px 0 25px; font-size: 12px; line-height: 1.8; }
 .integration-note > .icon { width: 15px; height: 15px; margin-top: 2px; }
 .integration-note.applied { color: #437d6c; background: #f0f8f4; border-color: #daece1; }
-.overview-bottom { display: grid; grid-template-columns: minmax(0, 1.12fr) minmax(260px, .88fr); gap: 20px; align-items: start; }
-.device-summary .table-wrap table { min-width: 400px; }
-.device-summary th, .device-summary td { padding-left: 20px; padding-right: 20px; }
-.device-summary .empty-cell { padding: 37px 22px; }
-.surface-footnote { border-top: 1px solid #edf1f3; padding: 13px 20px; color: #617583; font-size: 12px; }
 .steps { list-style: none; margin: 0; padding: 0 23px 22px; }
 .steps li { display: flex; align-items: flex-start; gap: 12px; margin-top: 17px; }
 .steps li:first-child { margin-top: 0; }
 .steps li > span { color: #6c9a9f; background: #eef6f6; border: 1px solid #e4efef; border-radius: 6px; padding: 1px 5px; font-size: 12px; line-height: 19px; }
 .steps strong { font-size: 12px; font-weight: 550; color: #4f6979; }
 .steps p { color: #617583; font-size: 12px; margin-top: 3px; line-height: 1.8; }
-.device-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 22px 23px; }
-.compact-field { margin: 0; width: min(100%, 320px); }
-.compact-field label { color: #6a7f8d; font-size: 12px; }
-.quota { text-align: right; }
-.quota strong { display: block; color: #47636f; font-size: 22px; font-weight: 600; letter-spacing: -.5px; margin-top: 2px; }
-#devices-content table { min-width: 640px; }
 .info-callout { padding: 15px 18px; border: 1px solid #dee9ee; background: #f0f6f8; border-radius: 8px; color: #6a8594; font-size: 12px; line-height: 1.8; }
 .info-callout strong { display: block; color: #526e7c; font-size: 12px; margin-bottom: 3px; font-weight: 550; }
 .subtle-label { font-size: 12px; color: #617583; }
@@ -254,7 +243,7 @@ fieldset .field-hint { margin-top: 8px; }
 @media (min-width: 1600px) { .content { padding-inline: 46px; } .topbar { padding-inline: 46px; } }
 @media (max-width: 1150px) {
   .content { padding: 27px 25px 0; } .topbar { padding-inline: 25px; }
-  .overview-bottom { grid-template-columns: 1fr; } .identity-caption small { display: none; }
+  .identity-caption small { display: none; }
   .details-list { gap: 25px; } .identity-strip { gap: 18px; padding: 20px; }
   .network-card-main { gap: 12px; padding: 19px; } .network-card-footer { padding-inline: 19px; }
   .network-card .status { font-size: 12px; padding: 3px 6px; }
@@ -294,8 +283,7 @@ fieldset .field-hint { margin-top: 8px; }
   .table-toolbar { padding: 0 16px 16px; gap: 8px; } .search-field { width: 100%; flex: 1; min-width: 0; }
   .toolbar-actions select { width: 96px; } .toolbar-actions { gap: 6px; flex-shrink: 0; } th, td { padding-inline: 18px; }
   .table-footer { padding: 13px 18px; font-size: 12px; } .context-note { font-size: 12px; }
-  .device-toolbar { padding: 18px; gap: 16px; } .quota { flex-shrink: 0; } .quota strong { font-size: 18px; }
-  .compact-field { max-width: 240px; } .pager { padding-inline: 17px; } .pager > .small-text { display: none; }
+  .pager { padding-inline: 17px; } .pager > .small-text { display: none; }
   .pager > div { margin-left: auto; gap: 12px; } .workspace-footer { margin-top: 24px; font-size: 12px; }
   .dialog-heading { padding: 20px; } .dialog-body { padding: 20px 20px 8px; } .dialog-actions { padding: 16px 20px; }
 }

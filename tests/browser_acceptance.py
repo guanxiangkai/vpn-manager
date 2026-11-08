@@ -104,14 +104,13 @@ def test_admin_login_refresh_pages_and_logout(context, live_env):
     expect(page.locator("#signed-in-user")).to_contain_text("adminone", timeout=15_000)
     _capture(page, "admin-overview")
 
-    page.locator('.nav-item[data-page="devices"]').click()
-    expect(page.locator("#devices-page")).to_be_visible()
-    expect(page.locator("#device-account-select")).to_be_enabled(timeout=15_000)
+    expect(page.locator('.nav-item[data-page="devices"], #devices-page, #my-devices-title, #device-dialog')).to_have_count(0)
 
     page.locator('.nav-item[data-page="users"]').click()
     expect(page.locator("#users-page")).to_be_visible()
     expect(page.locator("#users-content")).to_be_visible(timeout=15_000)
     expect(page.locator("#users-body")).to_contain_text("adminone")
+    expect(page.locator("#users-body").get_by_role("button", name="设备记录")).to_have_count(0)
 
     page.locator('.nav-item[data-page="audit"]').click()
     expect(page.locator("#audit-page")).to_be_visible()
@@ -127,12 +126,12 @@ def test_admin_login_refresh_pages_and_logout(context, live_env):
     expect(page.locator("#app-view")).to_be_hidden()
 
 
-def test_member_can_read_own_records_but_cannot_see_admin_management(context, live_env):
+def test_member_can_read_own_access_overview(context, live_env):
     page = context.new_page()
     _login(page, live_env, MEMBER)
-    expect(page.get_by_role("heading", name="我的设备记录", exact=True)).to_be_visible()
-    expect(page.locator("#own-devices-content")).to_be_visible(timeout=15_000)
-    for page_name in ("users", "devices", "audit"):
+    expect(page.get_by_role("heading", name="连接说明", exact=True)).to_be_visible()
+    expect(page.locator("#my-devices-title")).to_have_count(0)
+    for page_name in ("users", "networks", "audit"):
         expect(page.locator(f'.nav-item[data-page="{page_name}"]')).to_be_hidden()
     expect(page.get_by_role("button", name="退出登录", exact=True)).to_be_visible()
     _capture(page, "member-overview")

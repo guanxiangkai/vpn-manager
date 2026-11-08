@@ -2,7 +2,7 @@
 
 `web/` 是无构建依赖的静态 ES 模块站点。支持同源部署，也支持香港 OSS 静态前端与独立 HTTPS API。公开目录只包含 `index.html`、JS、CSS 和 `config.json` 四个静态文件；不得上传账户秘密、数据库、私钥、源代码目录或服务器备份。
 
-页面按访问概览、账户管理、设备登记和登录审计组织，普通用户只显示自身授权。账户列表支持账户名搜索与状态组合筛选，列表错误可重试，审计使用服务端游标分页。设备登记始终显示其记录用途，网络卡片不冒充实时 VPN 连接状态。产品任务、视觉及状态边界见 [设计说明](DESIGN.md)。
+页面按访问概览、网络环境、账户与授权、登录审计组织，普通用户只显示自身授权。账户列表支持账户名搜索与状态组合筛选，列表错误可重试，审计使用服务端游标分页。网络卡片展示账户授权，实际连接状态以系统 VPN 为准。产品任务、视觉及状态边界见 [设计说明](DESIGN.md)。
 
 ## OSS 与独立 API
 
@@ -24,7 +24,6 @@ python scripts/package_web.py --api-origin https://203.0.113.10:8443 --fingerpri
 
 - API 只允许受服务端明确配置的 HTTPS Origin；CORS 是浏览器访问策略，不能代替账户认证与授权。同源 Cookie 模式保留 HttpOnly、Secure、SameSite=Lax 会话和启动恢复；跨站 Bearer 模式使用 `credentials: "omit"`，不设置会话 Cookie。
 - 登录响应与 `POST /api/auth/refresh` 的 `csrf_token` 仅保存在页面内存。`GET /api/auth/me` 仅返回无副作用的扁平用户资料，不轮换 CSRF。登录只使用账户和密码；浏览器不发送设备指纹或自定义认证头。
-- 设备名单是管理员维护的管理记录：每个账户至多 10 条 `registered` 记录，`removed` 记录不计数。它不验证设备身份、不签发或导入密钥，也不会阻止取得账户密码的新设备登录或连接 VPN；绝不能把设备记录或移除记录表示为实际 VPN 准入或撤销。
 
 两种模式都需要 HTTPS 服务器证书，不需要设备证书。生产 TLS、跨域登录、证书续期和公网网络边界须分别完成实际环境验收。
 
@@ -40,4 +39,4 @@ python scripts/package_web.py --api-origin https://203.0.113.10:8443 --fingerpri
 
 接口包括 `GET /health`，`POST /api/auth/login`、`POST /api/auth/logout`、`POST /api/auth/refresh`、`GET /api/auth/me`、`GET /api/vpn/status`，个人设备的 `GET /api/devices`、`POST /api/devices/{device_id}/remove`，`GET/POST /api/admin/users`、`PATCH /api/admin/users/{username}`、`POST /api/admin/users/{username}/deactivate`，`GET /api/admin/audit?cursor=&limit=20`，以及管理员专用的 `GET/POST /api/admin/users/{username}/devices`、`POST /api/admin/users/{username}/devices/{device_id}/remove`。Bearer 登录额外返回 `session_token`，Cookie 登录保持原响应且不返回该字段。写操作仍需严格 Origin、有效会话和内存 CSRF；账户变更会撤销旧会话。`GET /api/auth/me` 只返回扁平 `User`，不轮换凭据；错误体为 `{ "error": { "code": string, "message": string } }`。
 
-普通用户在页面查看自己的设备记录，不显示自助登记和移除入口；本人记录移除接口仅允许操作自己名下的记录。管理员才显示跨账户设备、账户和审计功能。服务端仍是账户认证、角色授权和数据隔离边界。
+普通用户在页面查看本人的网络授权。管理员可以管理网络、账户和审计。现有设备记录接口仍属于服务端兼容契约。服务端负责账户认证、角色授权和数据隔离。

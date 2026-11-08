@@ -42,6 +42,6 @@ def test_cross_origin_bearer_permissions_refresh_and_revocation(context, env):
     page.reload(wait_until="domcontentloaded"); expect(page.locator("#login-view")).to_be_visible(timeout=15_000)
     admin_token = _login(page, env, ADMIN); page.get_by_role("button", name="退出登录", exact=True).click(); expect(page.locator("#login-view")).to_be_visible(timeout=15_000)
     assert page.evaluate("""async args => (await fetch(args.api + '/api/auth/me', {headers: {Authorization: 'Bearer ' + args.token}})).status""", {"api": env["api"], "token": admin_token}) == 401
-    member_token = _login(page, env, MEMBER); expect(page.locator("#network-list")).to_contain_text("工作"); expect(page.locator("#network-list")).not_to_contain_text("家庭"); expect(page.locator("#own-devices-content")).to_be_visible(timeout=15_000)
-    for name in ("users", "devices", "audit"): expect(page.locator(f'.nav-item[data-page="{name}"]')).to_be_hidden()
+    member_token = _login(page, env, MEMBER); expect(page.locator("#network-list")).to_contain_text("工作"); expect(page.locator("#network-list")).not_to_contain_text("家庭"); expect(page.locator("#my-devices-title")).to_have_count(0)
+    for name in ("users", "networks", "audit"): expect(page.locator(f'.nav-item[data-page="{name}"]')).to_be_hidden()
     assert page.evaluate("""async args => (await fetch(args.api + '/api/admin/users', {headers: {Authorization: 'Bearer ' + args.token}})).status""", {"api": env["api"], "token": member_token}) == 403

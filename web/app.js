@@ -1,5 +1,5 @@
 const DEFAULT_AUDIT_LIMIT = 20;
-const state = { apiBaseUrl: "", sessionTransport: "cookie", sessionToken: null, csrfToken: null, user: null, users: [], usersSerial: 0, ownDevicesSerial: 0, deviceSerial: 0, deviceAccountsSerial: 0, deviceAccounts: [], selectedDeviceAccount: null, auditCursors: [null], auditIndex: 0, auditSerial: 0, networks: [], networkNames: new Map(), networksSerial: 0, editingNetwork: null, userDialogSerial: 0, requestIds: new Map() };
+const state = { apiBaseUrl: "", sessionTransport: "cookie", sessionToken: null, csrfToken: null, user: null, users: [], usersSerial: 0, auditCursors: [null], auditIndex: 0, auditSerial: 0, networks: [], networkNames: new Map(), networksSerial: 0, editingNetwork: null, userDialogSerial: 0, requestIds: new Map() };
 
 const $ = (selector) => document.querySelector(selector);
 const elements = {
@@ -8,10 +8,8 @@ const elements = {
   logout: $("#logout-button"), profileState: $("#profile-state"), profileContent: $("#profile-content"), networkList: $("#network-list"),
   usersState: $("#users-state"), usersContent: $("#users-content"), usersBody: $("#users-body"), auditState: $("#audit-state"),
   auditContent: $("#audit-content"), auditBody: $("#audit-body"), auditPrev: $("#audit-prev"), auditNext: $("#audit-next"), auditPageLabel: $("#audit-page-label"),
-  ownDevicesState: $("#own-devices-state"), ownDevicesContent: $("#own-devices-content"), ownDevicesBody: $("#own-devices-body"), devicesState: $("#devices-state"), devicesContent: $("#devices-content"), devicesBody: $("#devices-body"), deviceLimit: $("#device-limit"), deviceAccountSelect: $("#device-account-select"), openAddDevice: $("#open-add-device"),
   userDialog: $("#user-dialog"), userForm: $("#user-form"), userFormError: $("#user-form-error"), managedUsername: $("#managed-username"),
-  managedPassword: $("#managed-password"), editingUsername: $("#editing-username"), passwordHint: $("#password-hint"), userDialogTitle: $("#user-dialog-title"), saveUser: $("#save-user"),
-  deviceDialog: $("#device-dialog"), deviceForm: $("#device-form"), deviceFormError: $("#device-form-error"), deviceAccountNote: $("#device-account-note"), registeredDeviceId: $("#registered-device-id"), saveDevice: $("#save-device")
+  managedPassword: $("#managed-password"), editingUsername: $("#editing-username"), passwordHint: $("#password-hint"), userDialogTitle: $("#user-dialog-title"), saveUser: $("#save-user")
 };
 
 function showNotice(message) { elements.notice.textContent = message; elements.notice.hidden = false; window.setTimeout(() => { elements.notice.hidden = true; }, 4500); }
@@ -23,7 +21,6 @@ function roleText(role, protectedAccount = false) { return protectedAccount ? "�
 function networkInfo(network) { return state.networkNames.get(network); }
 function networkText(network) { return networkInfo(network)?.name || network; }
 function networkIcon(network) { return ["home", "work"].includes(network) ? network : "network"; }
-function deviceStateText(value) { return ({ registered: "已登记", removed: "已移除" })[value] || value; }
 function humanError(error) {
   return error.message;
 }
@@ -137,7 +134,6 @@ function renderProfile(user) {
   $("#user-avatar").textContent = user.username.slice(0, 1).toUpperCase();
   elements.signedInUser.replaceChildren(document.createTextNode(user.username), textElement("small", roleText(user.role, user.protected)));
   document.querySelectorAll(".admin-only").forEach((item) => { item.hidden = user.role !== "admin"; });
-  loadOwnDevices();
   loadVpnStatus(user);
   elements.profileContent.hidden = false; elements.profileState.hidden = true;
 }
@@ -199,16 +195,15 @@ async function loadVpnStatus(user) {
 function showLogin() {
   document.title = "登录 · VPN 管理器";
   // 会话切换必须使仍在飞行的旧账户读取结果过期，避免其覆盖新账户页面。
-  state.usersSerial += 1; state.ownDevicesSerial += 1; state.deviceSerial += 1; state.deviceAccountsSerial += 1; state.auditSerial += 1; state.networksSerial += 1; state.userDialogSerial += 1;
-  state.users = []; state.deviceAccounts = []; state.selectedDeviceAccount = null; state.auditCursors = [null]; state.auditIndex = 0;
+  state.usersSerial += 1; state.auditSerial += 1; state.networksSerial += 1; state.userDialogSerial += 1;
+  state.users = []; state.auditCursors = [null]; state.auditIndex = 0;
   $("#user-search").value = ""; $("#user-status-filter").value = "all";
   state.networks = []; state.networkNames.clear(); state.editingNetwork = null; $("#network-search").value = "";
   state.requestIds.forEach((controller) => controller.abort()); state.requestIds.clear();
   state.user = null; state.csrfToken = null; state.sessionToken = null;
   if (elements.userDialog.open) elements.userDialog.close();
-  if (elements.deviceDialog.open) elements.deviceDialog.close();
   if ($("#network-dialog").open) $("#network-dialog").close();
-  elements.userForm.reset(); elements.deviceForm.reset();
+  elements.userForm.reset();
   elements.appView.hidden = true; elements.loginView.hidden = false; elements.loginForm.reset(); clearError(elements.loginError); $("#username").focus();
 }
 function showApp(user) { elements.loginForm.reset(); renderProfile(user); elements.loginView.hidden = true; elements.appView.hidden = false; showPage("overview"); }
@@ -262,12 +257,12 @@ function showPage(page) {
     item.classList.toggle("active", current);
     if (current) item.setAttribute("aria-current", "page"); else item.removeAttribute("aria-current");
   });
-  const title = ({ overview: "访问概览", networks: "网络环境", users: "账户与授权", devices: "设备登记", audit: "登录审计" })[page];
+  const title = ({ overview: "访问概览", networks: "网络环境", users: "账户与授权", audit: "登录审计" })[page];
   $("#current-page-name").textContent = title;
   document.title = `${title} · VPN 管理器`;
   $("#main-content").focus({ preventScroll: true });
   window.scrollTo({ top: 0, behavior: "instant" });
-  if (page === "users") loadUsers(); if (page === "devices") loadDeviceAccounts(state.selectedDeviceAccount); if (page === "audit") loadAudit();
+  if (page === "users") loadUsers(); if (page === "audit") loadAudit();
   if (page === "networks") loadNetworks();
 }
 
@@ -398,13 +393,10 @@ function renderUsers() {
     const edit = textElement("button", "编辑", "link-button");
     edit.type = "button"; edit.setAttribute("aria-label", `编辑账户 ${user.username}`);
     edit.addEventListener("click", () => openUserDialog(user));
-    const devices = textElement("button", "设备记录", "link-button");
-    devices.type = "button"; devices.setAttribute("aria-label", `查看 ${user.username} 的设备记录`);
-    devices.addEventListener("click", () => openDevicesFor(user.username));
     const grant = textElement("button", "网络授权", "link-button");
     grant.type = "button"; grant.setAttribute("aria-label", `修改 ${user.username} 的网络授权`);
     grant.addEventListener("click", () => openUserDialog(user, true));
-    actions.append(edit, grant, devices);
+    actions.append(edit, grant);
     if (user.active) {
       const disable = textElement("button", "停用", "link-button danger");
       disable.type = "button"; disable.setAttribute("aria-label", `停用账户 ${user.username}`);
@@ -471,103 +463,6 @@ async function deactivateUser(user, button) {
   catch (error) { showNotice(`无法停用账户：${humanError(error)}`); } finally { setBusy(button, false, ""); }
 }
 
-async function loadOwnDevices() {
-  elements.ownDevicesContent.hidden = true;
-  setPanel(elements.ownDevicesState, "", "正在读取我的设备记录…");
-  const serial = ++state.ownDevicesSerial;
-  try {
-    const devices = expectArray(await apiRequest("/api/devices"), "我的设备列表");
-    if (serial !== state.ownDevicesSerial) return;
-    renderOwnDevices(Array.isArray(devices) ? devices : []);
-    elements.ownDevicesState.hidden = true;
-    elements.ownDevicesContent.hidden = false;
-  } catch (error) {
-    if (serial !== state.ownDevicesSerial || error.name === "AbortError") return;
-    if (isSessionError(error)) { showLogin(); return; }
-    const message = error.code === "authentication_required"
-      ? "登录已失效，请重新登录。"
-      : `无法读取我的设备记录：${humanError(error)}`;
-    setPanel(elements.ownDevicesState, "error", message);
-  }
-}
-function renderOwnDevices(devices) {
-  elements.ownDevicesBody.replaceChildren();
-  if (devices.length === 0) { emptyRow(elements.ownDevicesBody, 3, "还没有设备记录", "需要登记时，请联系管理员维护名单。"); return; }
-  devices.forEach((device) => { const row = document.createElement("tr"); const id = document.createElement("td"); id.textContent = device.device_id; row.append(id); const stateCell = document.createElement("td"); stateCell.append(statusBadge(deviceStateText(device.state), device.state === "registered" ? "active" : "inactive")); row.append(stateCell); const updated = document.createElement("td"); updated.textContent = deviceTime(device.updated_at); row.append(updated); elements.ownDevicesBody.append(row); });
-}
-
-function deviceLimitReached(devices) { return devices.filter((device) => device.state === "registered").length >= 10; }
-function deviceTime(value) { const date = new Date(value); return Number.isNaN(date.valueOf()) ? value : date.toLocaleString("zh-CN", { hour12: false }); }
-async function loadDeviceAccounts(selectedAccount = state.selectedDeviceAccount) {
-  elements.devicesContent.hidden = true;
-  elements.deviceAccountSelect.disabled = true;
-  elements.openAddDevice.disabled = true;
-  setPanel(elements.devicesState, "", "正在读取可管理账户…");
-  const serial = ++state.deviceAccountsSerial;
-  try {
-    const users = expectArray(await apiRequest("/api/admin/users"), "可管理账户列表");
-    if (serial !== state.deviceAccountsSerial) return;
-    state.deviceAccounts = users;
-    elements.deviceAccountSelect.replaceChildren();
-    state.deviceAccounts.forEach((user) => { const option = document.createElement("option"); option.value = user.username; option.textContent = `${user.username} · ${roleText(user.role)}`; elements.deviceAccountSelect.append(option); });
-    elements.deviceAccountSelect.disabled = state.deviceAccounts.length === 0;
-    if (state.deviceAccounts.length === 0) { setPanel(elements.devicesState, "empty", "没有可管理账户。"); elements.openAddDevice.disabled = true; return; }
-    const account = selectedAccount && state.deviceAccounts.some((user) => user.username === selectedAccount) ? selectedAccount : (elements.deviceAccountSelect.value || state.user.username);
-    state.selectedDeviceAccount = account;
-    elements.deviceAccountSelect.value = account;
-    await loadDevices(account);
-  } catch (error) { if (serial !== state.deviceAccountsSerial || error.name === "AbortError") return; if (isSessionError(error)) return showLogin(); setPanel(elements.devicesState, "error", `无法读取可管理账户：${humanError(error)}`); }
-}
-function openDevicesFor(account) { state.selectedDeviceAccount = account; showPage("devices"); }
-async function loadDevices(account = elements.deviceAccountSelect.value) {
-  if (!account) return;
-  elements.devicesContent.hidden = true;
-  elements.openAddDevice.disabled = true;
-  setPanel(elements.devicesState, "", "正在读取设备记录…");
-  const serial = ++state.deviceSerial;
-  try {
-    const devices = expectArray(await apiRequest(`/api/admin/users/${encodeURIComponent(account)}/devices`), "设备列表");
-    if (serial !== state.deviceSerial) return;
-    renderDevices(Array.isArray(devices) ? devices : [], account);
-    elements.devicesState.hidden = true;
-    elements.devicesContent.hidden = false;
-  } catch (error) { if (serial === state.deviceSerial && error.name !== "AbortError") { if (isSessionError(error)) return showLogin(); setPanel(elements.devicesState, "error", `无法读取设备记录：${humanError(error)}`); } }
-}
-function renderDevices(devices, account) {
-  elements.devicesBody.replaceChildren();
-  const limitReached = deviceLimitReached(devices);
-  const registeredCount = devices.filter((device) => device.state === "registered").length;
-  elements.deviceLimit.textContent = `${registeredCount} / 10`;
-  elements.openAddDevice.disabled = limitReached;
-  elements.openAddDevice.title = limitReached ? "该账户已达到 10 条已登记设备记录上限。" : "";
-  if (devices.length === 0) emptyRow(elements.devicesBody, 4, "这个账户还没有设备记录", "点击“登记设备”，添加便于管理的设备标识。");
-  devices.forEach((device) => { const row = document.createElement("tr"); const id = document.createElement("td"); id.textContent = device.device_id; row.append(id); const stateCell = document.createElement("td"); stateCell.append(statusBadge(deviceStateText(device.state), device.state === "registered" ? "active" : "inactive")); row.append(stateCell); const updated = document.createElement("td"); updated.textContent = deviceTime(device.updated_at); row.append(updated); const actions = document.createElement("td"); actions.className = "table-actions"; if (device.state === "registered") { const remove = document.createElement("button"); remove.className = "link-button"; remove.type = "button"; remove.textContent = "移除记录"; remove.addEventListener("click", () => removeDevice(account, device, remove)); actions.append(remove); } else { actions.textContent = "—"; } row.append(actions); elements.devicesBody.append(row); });
-}
-function openDeviceDialog() {
-  const account = elements.deviceAccountSelect.value;
-  if (!account) return;
-  elements.deviceForm.reset(); clearError(elements.deviceFormError);
-  elements.deviceAccountNote.textContent = `账户：${account}。最多可保留 10 条已登记设备记录。`;
-  elements.deviceDialog.showModal(); elements.registeredDeviceId.focus();
-}
-async function submitDeviceRegistration(event) {
-  event.preventDefault(); clearError(elements.deviceFormError);
-  if (!elements.deviceForm.reportValidity()) return;
-  const account = elements.deviceAccountSelect.value;
-  if (!account) return;
-  setBusy(elements.saveDevice, true, "正在登记…");
-  try {
-    await apiRequest(`/api/admin/users/${encodeURIComponent(account)}/devices`, { method: "POST", body: { device_id: elements.registeredDeviceId.value.trim() }, mutation: true });
-    elements.deviceDialog.close(); showNotice("设备登记记录已保存；该记录不验证或限制设备登录，也不表示 VPN 已可用。"); await loadDevices(account);
-  } catch (error) { showError(elements.deviceFormError, humanError(error)); } finally { setBusy(elements.saveDevice, false, ""); }
-}
-async function removeDevice(account, device, button) {
-  if (!window.confirm(`确定移除设备“${device.device_id}”的登记记录吗？这不会阻止持有账户密码的设备登录或连接 VPN。`)) return;
-  setBusy(button, true, "移除中…");
-  try { await apiRequest(`/api/admin/users/${encodeURIComponent(account)}/devices/${encodeURIComponent(device.device_id)}/remove`, { method: "POST", mutation: true }); showNotice("设备登记记录已移除；该操作不影响账户密码登录或 VPN 准入。"); await loadDevices(account); }
-  catch (error) { showNotice(`无法移除设备记录：${humanError(error)}`); } finally { setBusy(button, false, ""); }
-}
-
 async function loadAudit() {
   elements.auditContent.hidden = true; setPanel(elements.auditState, "", "正在读取审计记录…"); const cursor = state.auditCursors[state.auditIndex];
   const serial = ++state.auditSerial;
@@ -629,11 +524,6 @@ $("#close-user-dialog").addEventListener("click", () => elements.userDialog.clos
 $("#cancel-user").addEventListener("click", () => elements.userDialog.close());
 elements.userDialog.addEventListener("close", () => { state.userDialogSerial += 1; });
 elements.userForm.addEventListener("submit", submitUser);
-elements.openAddDevice.addEventListener("click", openDeviceDialog);
-$("#close-device-dialog").addEventListener("click", () => elements.deviceDialog.close());
-$("#cancel-device").addEventListener("click", () => elements.deviceDialog.close());
-elements.deviceForm.addEventListener("submit", submitDeviceRegistration);
-elements.deviceAccountSelect.addEventListener("change", () => { state.selectedDeviceAccount = elements.deviceAccountSelect.value; loadDevices(); });
 elements.auditPrev.addEventListener("click", () => { if (state.auditIndex > 0) { state.auditIndex -= 1; loadAudit(); } });
 elements.auditNext.addEventListener("click", () => { if (state.auditCursors[state.auditIndex + 1] != null) { state.auditIndex += 1; loadAudit(); } });
 
