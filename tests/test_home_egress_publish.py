@@ -132,14 +132,18 @@ class TestHomeEgressPublish(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def prepare(self, *, rollback_python=None, extra_module_path=None):
+    def prepare(self, *, rollback_python=None, extra_module_path=None, split_tunnel=False):
+        candidate_module = self.module if split_tunnel else self.candidate_module
+        candidate_extra = self.extra if split_tunnel else self.candidate_extra
         with patch.object(publish, "_load_rollback", return_value=FakeRollback()):
-            return publish.prepare(self.txn, candidate_module=self.candidate_module, candidate_extra=self.candidate_extra,
-                                   candidate_module_hash=digest(self.candidate_module), candidate_extra_hash=digest(self.candidate_extra),
+            return publish.prepare(self.txn, candidate_module=candidate_module, candidate_extra=candidate_extra,
+                                   candidate_module_hash=digest(candidate_module), candidate_extra_hash=digest(candidate_extra),
                                    baseline_module_hash=digest(self.module), baseline_config_hash=digest(self.config),
                                    module_path=self.module, extra_module_path=extra_module_path or self.extra, config_path=self.config,
                                    state_directory=self.state, agent_service="test-agent.service", control_socket_path=self.root / "control",
-                                   rollback_python=rollback_python or self.rollback_python, home_dns=self.home_dns, rollback_source=self.rollback,
+                                   rollback_python=rollback_python or self.rollback_python,
+                                   home_dns=None if split_tunnel else self.home_dns, split_tunnel=split_tunnel,
+                                   rollback_source=self.rollback,
                                    runner=self.runner, enforce_root=False)
 
     def journal(self):
@@ -279,6 +283,30 @@ class TestHomeEgressPublish(unittest.TestCase):
         rollback = FakeRollback(self.runner)
         with patch.object(publish, "_load_rollback", return_value=rollback), patch.object(publish, "_timer_proof", return_value=True):
             self.assertEqual(publish.apply(self.txn, runner=self.runner, enforce_root=False), "applied")
+        self.assertEqual(rollback.events, ["ready", "block", "ready", "unblock"])
+
+    def test_split_apply_changes_only_the_gateway_configuration(self):
+        config = json.loads(self.config.read_text())
+        config["home_internet"] = {"enabled": True, "dns": ["192.0.2.53"], "routing_table": 151}
+        write_private(self.config, json.dumps(config).encode())
+        write_private(self.extra, b"baseline_egress = 1\n")
+        source_digests = (digest(self.module), digest(self.extra))
+
+        self.assertEqual(self.prepare(split_tunnel=True), "prepared")
+        journal = self.journal()
+        self.assertEqual(journal["routing"]["table"], 151)
+        self.assertEqual(journal["split_config"], "staged")
+        self.assertTrue(json.loads(self.config.read_text())["home_internet"]["enabled"])
+        journal["status"] = "armed"
+        write_private(self.txn / "journal.json", json.dumps(journal).encode())
+        rollback = FakeRollback(self.runner)
+        with patch.object(publish, "_load_rollback", return_value=rollback), patch.object(publish, "_timer_proof", return_value=True):
+            self.assertEqual(publish.apply(self.txn, runner=self.runner, enforce_root=False), "applied")
+
+        config["home_internet"]["enabled"] = False
+        self.assertEqual(json.loads(self.config.read_text()), config)
+        self.assertEqual((digest(self.module), digest(self.extra)), source_digests)
+        self.assertEqual(self.journal()["split_config"], "applying")
         self.assertEqual(rollback.events, ["ready", "block", "ready", "unblock"])
 
     def test_apply_refuses_stale_baseline_before_block_or_stop(self):
