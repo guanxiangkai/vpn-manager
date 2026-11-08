@@ -1,0 +1,67 @@
+name: IKEv2 split routing acceptance
+
+on:
+  push:
+    branches: [codex/vpn-split-routing-check]
+
+permissions:
+  contents: read
+
+jobs:
+  namespace-acceptance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.11'
+      - name: Install isolated runner prerequisites
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gnupg iproute2 iputils-ping libcap-dev libssl-dev nftables openssl pkg-config
+          python -m pip install --disable-pip-version-check -e .
+      - name: Build strongSwan 6.1.0
+        run: |
+          cd "$RUNNER_TEMP"
+          for file in strongswan-6.1.0.tar.bz2 strongswan-6.1.0.tar.bz2.sig STRONGSWAN-RELEASE-PGP-KEY; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 180 \
+              "https://download.strongswan.org/$file" -o "$file"
+          done
+          gpg --batch --dearmor --output "$RUNNER_TEMP/strongswan-release.gpg" STRONGSWAN-RELEASE-PGP-KEY
+          gpgv --status-fd 1 --keyring "$RUNNER_TEMP/strongswan-release.gpg" \
+            strongswan-6.1.0.tar.bz2.sig strongswan-6.1.0.tar.bz2 |
+            grep -F '[GNUPG:] VALIDSIG 948F158A4E76A27BF3D07532DF42C170B34DBA77 '
+          tar -xjf strongswan-6.1.0.tar.bz2
+          cd strongswan-6.1.0
+          prefix="$RUNNER_TEMP/strongswan"
+          ./configure --prefix="$prefix" --with-piddir="$prefix/run" \
+            --enable-eap-identity --enable-eap-mschapv2 --enable-md4 --enable-openssl --disable-gmp \
+            > configure-output.log 2>&1 || { tail -120 configure-output.log; exit 1; }
+          make -j"$(nproc)" > build-output.log 2>&1 || { tail -120 build-output.log; exit 1; }
+          make install > install-output.log 2>&1 || { tail -120 install-output.log; exit 1; }
+          test -x "$prefix/libexec/ipsec/charon"
+      - name: Exercise full and split routing in network namespaces
+        run: |
+          evidence="$RUNNER_TEMP/ikev2-evidence"
+          mkdir -m 700 "$evidence"
+          python_bin="$(command -v python)"
+          args=(--prefix "$RUNNER_TEMP/strongswan" --workdir "$evidence" --timeout 180)
+          status=0
+          sudo env "PYTHONPATH=$GITHUB_WORKSPACE" "$python_bin" tests/home_egress_namespace_acceptance.py "${args[@]}" || status=1
+          sudo env "PYTHONPATH=$GITHUB_WORKSPACE" "$python_bin" tests/home_egress_namespace_acceptance.py "${args[@]}" --split-tunnel || status=1
+          exit "$status"
+      - name: Read isolated failure evidence
+        if: failure()
+        run: |
+          evidence="$RUNNER_TEMP/ikev2-evidence"
+          if [[ -d "$evidence" ]]; then
+            sudo find "$evidence" -type f \( -name failure.txt -o -name last-command.stderr \
+              -o -name projection-diagnostic.json -o -name daemon.log \) -print -exec tail -40 {} \;
+          fi
