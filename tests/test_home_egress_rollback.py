@@ -28,6 +28,8 @@ class FakeRunner:
         self.blocked = False
         self.fail_stop = False
         self.fail_start = False
+        self.fail_timer_disable = False
+        self.timer_active = True
         self.start_probe = None
 
     @staticmethod
@@ -92,8 +94,14 @@ class FakeRunner:
                 return self.result(1)
             self.active = True
             return self.result()
+        if argv[:3] == ["/bin/systemctl", "disable", "--now"] and argv[3].endswith(".timer"):
+            if self.fail_timer_disable:
+                return self.result(1)
+            self.timer_active = False
+            return self.result()
         if argv[:3] == ["/bin/systemctl", "is-active", "--quiet"]:
-            return self.result(0 if self.active else 3)
+            active = self.timer_active if argv[3].endswith(".timer") else self.active
+            return self.result(0 if active else 3)
         raise AssertionError(argv)
 
 
@@ -180,6 +188,42 @@ class TestHomeEgressRollback(unittest.TestCase):
         self.assertTrue(runner.active)
         self.assertFalse(runner.blocked)
         self.assertEqual(status(self.txn), "rolled_back")
+
+    def test_split_rollback_preserves_preexisting_modules(self):
+        write_private(self.module, (self.txn / "baseline-gateway_agent.py").read_bytes())
+        self.journal["candidate_module_hash"] = digest(self.module)
+        self.journal["split_config"] = "applying"
+        write_private(self.txn / "journal.json", json.dumps(self.journal).encode())
+        runner = FakeRunner()
+        readiness = iter((False, True))
+
+        self.assertEqual(rollback(self.txn, runner=runner, enforce_root=False,
+                                  status_probe=lambda _path, _expected: next(readiness)), "rolled_back")
+        self.assertEqual(self.config.read_bytes(), b"baseline config\n")
+        self.assertEqual(digest(self.module), self.journal["baseline_module_hash"])
+        self.assertEqual(digest(self.extra), self.journal["extra_hash"])
+        self.assertTrue(runner.active)
+        self.assertFalse(runner.blocked)
+        self.assertFalse(runner.timer_active)
+
+    def test_expired_split_timer_before_apply_does_not_touch_runtime(self):
+        write_private(self.config, (self.txn / "baseline-gateway.json").read_bytes())
+        self.journal["candidate_module_hash"] = self.journal["baseline_module_hash"]
+        self.journal["split_config"] = "staged"
+        write_private(self.txn / "journal.json", json.dumps(self.journal).encode())
+        runner = FakeRunner()
+        runner.fail_timer_disable = True
+
+        with self.assertRaisesRegex(RollbackError, "rollback_timer_stop_failed"):
+            rollback(self.txn, runner=runner, enforce_root=False)
+        self.assertEqual(status(self.txn), "rolled_back")
+        runner.fail_timer_disable = False
+        self.assertEqual(rollback(self.txn, runner=runner, enforce_root=False), "rolled_back")
+        self.assertEqual(self.config.read_bytes(), b"baseline config\n")
+        self.assertEqual(digest(self.extra), self.journal["extra_hash"])
+        self.assertTrue(runner.active)
+        self.assertFalse(runner.timer_active)
+        self.assertTrue(all(argv[-1] == "vpn-home-egress-rollback-txn.timer" for argv, _ in runner.calls))
 
     def test_failed_stop_keeps_block_and_transaction_recoverable(self):
         runner = FakeRunner()
