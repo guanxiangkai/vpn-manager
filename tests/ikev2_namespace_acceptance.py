@@ -107,10 +107,18 @@ class Acceptance:
     def launch(self,role):
         directory=self.root/role; directory.mkdir(mode=0o700)
         conf,control=directory/'strongswan.conf',directory/'vici'
+        resolver = directory / 'resolv.conf'
+        resolver.write_text('nameserver 10.240.2.1\n')
         conf.write_text(f'''charon {{
  plugins {{
   vici {{
    socket = unix://{control}
+  }}
+  resolve {{
+   file = {resolver}
+   resolvconf {{
+    path = {directory}/resolvconf-disabled
+   }}
   }}
  }}
 }}
