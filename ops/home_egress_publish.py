@@ -194,7 +194,9 @@ def _load_journal(transaction: Path, *, root_required: bool) -> tuple[dict[str, 
         journal = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise PublishError("publish_journal_invalid") from error
-    if not isinstance(journal, dict) or journal.get("status") not in {"prepared", "armed", "accepted"}:
+    if not isinstance(journal, dict) or journal.get("status") not in {
+        "prepared", "armed", "accepted", "rolling_back", "rolled_back",
+    }:
         raise PublishError("publish_journal_invalid")
     return journal, hashlib.sha256(raw).hexdigest()
 
@@ -273,13 +275,19 @@ def _require_hash(path: Path, supplied: str) -> str:
     return supplied
 
 
-def _render_candidate_config(config: Path, home_dns: str) -> bytes:
+def _render_candidate_config(config: bytes, home_dns: str | None, *, split_tunnel: bool = False) -> bytes:
     try:
-        settings = json.loads(config.read_bytes())
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        settings = json.loads(config)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise PublishError("publish_config_invalid") from error
     if not isinstance(settings, dict):
         raise PublishError("publish_config_invalid")
+    if split_tunnel:
+        home = settings.get("home_internet")
+        if home_dns is not None or not isinstance(home, dict) or home.get("enabled") is not True:
+            raise PublishError("publish_split_baseline_invalid")
+        home["enabled"] = False
+        return (json.dumps(settings, sort_keys=True, separators=(",", ":")) + "\n").encode()
     try:
         dns = str(ipaddress.IPv4Address(home_dns))
     except (ValueError, TypeError) as error:
@@ -335,7 +343,8 @@ def _unit_baseline(agent_service: str, runner: Runner) -> dict[str, str]:
 def prepare(txn_dir: str | os.PathLike[str], *, candidate_module: str | os.PathLike[str], candidate_extra: str | os.PathLike[str],
             candidate_module_hash: str, candidate_extra_hash: str, baseline_module_hash: str, baseline_config_hash: str,
             module_path: Path, extra_module_path: Path, config_path: Path, state_directory: Path,
-            agent_service: str, control_socket_path: Path, rollback_python: Path, home_dns: str,
+            agent_service: str, control_socket_path: Path, rollback_python: Path, home_dns: str | None,
+            split_tunnel: bool = False,
             rollback_source: Path | None = None, runner: Runner = _default_runner, enforce_root: bool = True) -> str:
     """创建私有不可覆盖事务，并在切换前确认当前账户投影已实际 applied。"""
     if enforce_root and os.geteuid() != 0:
@@ -359,9 +368,14 @@ def prepare(txn_dir: str | os.PathLike[str], *, candidate_module: str | os.PathL
         _probe_rollback_python(rollback_python, runner)
         if SHA256_RE.fullmatch(baseline_module_hash) is None or _sha256(module_path) != baseline_module_hash:
             raise PublishError("publish_baseline_module_changed")
-        if SHA256_RE.fullmatch(baseline_config_hash) is None or _sha256(config_path) != baseline_config_hash:
+        baseline_config = config_path.read_bytes()
+        if hashlib.sha256(baseline_config).hexdigest() != baseline_config_hash:
             raise PublishError("publish_baseline_config_changed")
-        if extra_module_path.exists():
+        if split_tunnel:
+            _regular(extra_module_path, root_required=enforce_root)
+            if candidate_module_hash != baseline_module_hash or _sha256(extra_module_path) != candidate_extra_hash:
+                raise PublishError("publish_split_source_changed")
+        elif extra_module_path.exists():
             raise PublishError("publish_extra_already_exists")
         _require_hash(candidate_module_path, candidate_module_hash)
         _require_hash(candidate_extra_path, candidate_extra_hash)
@@ -372,11 +386,12 @@ def prepare(txn_dir: str | os.PathLike[str], *, candidate_module: str | os.PathL
         _regular(lock_path, root_required=enforce_root)
         pools = _known_pools(accounts_path)
         unit_baseline = _unit_baseline(agent_service, runner)
-        candidate_config = _render_candidate_config(config_path, home_dns)
+        candidate_config = _render_candidate_config(baseline_config, home_dns, split_tunnel=split_tunnel)
         _write_new_private(transaction / "baseline-gateway_agent.py", module_path.read_bytes(), root_required=enforce_root)
-        _write_new_private(transaction / "baseline-gateway.json", config_path.read_bytes(), root_required=enforce_root)
-        _write_new_private(transaction / "candidate-gateway_agent.py", candidate_module_path.read_bytes(), root_required=enforce_root)
-        _write_new_private(transaction / "candidate-home_egress.py", candidate_extra_path.read_bytes(), root_required=enforce_root)
+        _write_new_private(transaction / "baseline-gateway.json", baseline_config, root_required=enforce_root)
+        if not split_tunnel:
+            _write_new_private(transaction / "candidate-gateway_agent.py", candidate_module_path.read_bytes(), root_required=enforce_root)
+            _write_new_private(transaction / "candidate-home_egress.py", candidate_extra_path.read_bytes(), root_required=enforce_root)
         _write_new_private(transaction / "candidate-gateway.json", candidate_config, root_required=enforce_root)
         source = rollback_source or Path(__file__).with_name("home_egress_rollback.py")
         _regular(source, root_required=False)
@@ -388,6 +403,11 @@ def prepare(txn_dir: str | os.PathLike[str], *, candidate_module: str | os.PathL
                    "accounts_path": str(accounts_path), "agent_service": agent_service, "state_lock_path": str(lock_path),
                    "control_socket_path": str(control_socket_path), "routing": {"table": 150, "priority": 18000, "protocol": 186},
                    "known_pools": pools, "unit_baseline": unit_baseline, "rollback_python": str(rollback_python)}
+        if split_tunnel:
+            home = json.loads(candidate_config)["home_internet"]
+            journal["routing"] = {"table": home.get("routing_table", 150), "priority": home.get("rule_priority", 18000),
+                                  "protocol": home.get("rule_protocol", 186)}
+            journal["split_config"] = "staged"
         _write_new_private(transaction / "journal.json", (json.dumps(journal, sort_keys=True, separators=(",", ":")) + "\n").encode(), root_required=enforce_root)
         rollback = _load_rollback(transaction)
         expected = rollback._expected_applied_accounts(journal, root_required=enforce_root)
@@ -477,20 +497,33 @@ def apply(txn_dir: str | os.PathLike[str], *, runner: Runner = _default_runner, 
     requires_rollback = False
     failure: Exception | None = None
     try:
-        journal, _digest = _load_journal(transaction, root_required=enforce_root)
+        journal, digest = _load_journal(transaction, root_required=enforce_root)
         rollback = _load_rollback(transaction)
         rollback._validate_journal(journal)
         rollback_python = _rollback_python(_journal_absolute(journal, "rollback_python"), root_required=enforce_root)
         if journal["status"] != "armed" or not _timer_proof(transaction, rollback_python, runner):
             raise PublishError("publish_timer_not_active")
-        if _sha256(Path(journal["module_path"])) != journal["baseline_module_hash"] or _sha256(Path(journal["config_path"])) != journal["config_hash"] or Path(journal["extra_module_path"]).exists():
+        extra_path = Path(journal["extra_module_path"])
+        split_config = journal.get("split_config")
+        if split_config:
+            _regular(extra_path, root_required=enforce_root)
+            if split_config != "staged" or _sha256(extra_path) != journal["extra_hash"]:
+                raise PublishError("publish_compare_failed")
+            _require_hash(transaction / "candidate-gateway.json", journal["candidate_config_hash"])
+        elif extra_path.exists() or extra_path.is_symlink():
+            raise PublishError("publish_compare_failed")
+        if (_sha256(Path(journal["module_path"])) != journal["baseline_module_hash"]
+                or _sha256(Path(journal["config_path"])) != journal["config_hash"]):
             raise PublishError("publish_compare_failed")
         # prepare 与 apply 间状态可能变化；此处拒绝可避免的断流，不建立阻断也不停止服务。
         if not rollback._wait_ready(journal, runner, root_required=enforce_root, status_probe=None):
             raise PublishError("publish_baseline_not_ready")
+        pools, reqids = rollback._pools_and_reqids(journal, root_required=enforce_root)
+        if split_config:
+            journal["split_config"] = "applying"
+            _replace_journal(transaction, digest, journal, root_required=enforce_root)
         # 阻断在停 agent 前建立；任何中断均由 rollback 保持闭合直至旧服务确认就绪。
         requires_rollback = True
-        pools, reqids = rollback._pools_and_reqids(journal, root_required=enforce_root)
         rollback._install_block(runner, pools, reqids)
         if _rc(_systemctl(runner, "stop", journal["agent_service"])) != 0 or _rc(_systemctl(runner, "is-active", "--quiet", journal["agent_service"])) == 0:
             raise PublishError("publish_agent_stop_failed")
@@ -502,9 +535,12 @@ def apply(txn_dir: str | os.PathLike[str], *, runner: Runner = _default_runner, 
         lock_fd = os.open(lock_path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            _atomic_copy(transaction / "candidate-gateway_agent.py", Path(journal["module_path"]), journal["baseline_module_hash"], root_required=enforce_root)
-            _atomic_copy(transaction / "candidate-home_egress.py", Path(journal["extra_module_path"]), None, root_required=enforce_root)
+            if not split_config:
+                _atomic_copy(transaction / "candidate-gateway_agent.py", Path(journal["module_path"]), journal["baseline_module_hash"], root_required=enforce_root)
+                _atomic_copy(transaction / "candidate-home_egress.py", extra_path, None, root_required=enforce_root)
             _atomic_copy(transaction / "candidate-gateway.json", Path(journal["config_path"]), journal["config_hash"], root_required=enforce_root)
+            if split_config and _sha256(Path(journal["config_path"])) != journal["candidate_config_hash"]:
+                raise PublishError("publish_candidate_not_current")
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
@@ -544,7 +580,7 @@ def accept(txn_dir: str | os.PathLike[str], *, runner: Runner = _default_runner,
             if _rc(_systemctl(runner, "disable", "--now", timer)) != 0 or _rc(_systemctl(runner, "is-active", "--quiet", timer)) == 0:
                 raise PublishError("publish_timer_stop_failed")
             return "accepted"
-        if journal["status"] != "armed":
+        if journal["status"] != "armed" or journal.get("split_config") == "staged":
             raise PublishError("publish_not_armed")
         if (_sha256(Path(journal["module_path"])) != journal["candidate_module_hash"]
                 or _sha256(Path(journal["config_path"])) != journal["candidate_config_hash"]
@@ -581,7 +617,10 @@ def main() -> int:
     prepare_parser.add_argument("--module-path", required=True); prepare_parser.add_argument("--extra-module-path", required=True)
     prepare_parser.add_argument("--config-path", required=True); prepare_parser.add_argument("--state-directory", required=True)
     prepare_parser.add_argument("--agent-service", required=True); prepare_parser.add_argument("--control-socket-path", required=True)
-    prepare_parser.add_argument("--rollback-python", required=True); prepare_parser.add_argument("--home-dns", required=True)
+    prepare_parser.add_argument("--rollback-python", required=True)
+    mode = prepare_parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--home-dns")
+    mode.add_argument("--split-tunnel", action="store_true")
     for command in ("arm", "apply", "accept", "status"):
         item = sub.add_parser(command); item.add_argument("--txn-dir", required=True)
     args = parser.parse_args()
@@ -593,7 +632,8 @@ def main() -> int:
                              module_path=Path(args.module_path), extra_module_path=Path(args.extra_module_path),
                              config_path=Path(args.config_path), state_directory=Path(args.state_directory),
                              agent_service=args.agent_service, control_socket_path=Path(args.control_socket_path),
-                             rollback_python=Path(args.rollback_python), home_dns=args.home_dns)
+                             rollback_python=Path(args.rollback_python), home_dns=args.home_dns,
+                             split_tunnel=args.split_tunnel)
         elif args.command == "arm": result = arm(args.txn_dir)
         elif args.command == "apply": result = apply(args.txn_dir)
         elif args.command == "accept": result = accept(args.txn_dir)
